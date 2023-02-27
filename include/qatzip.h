@@ -2552,6 +2552,1044 @@ QATZIP_API int qzMetadataBlockWrite(uint32_t block_num,
                                     uint32_t *block_flags,
                                     uint32_t *block_hash);
 
+
+
+typedef void (*AQzFunc_t)(int, void*);
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Supported operation types
+ *
+ * @description
+ *      This enumerated list identifies operation types supported
+ *    by Async QATZip.
+ *
+ *****************************************************************************/
+typedef enum QzFuncMode_E {
+    QZ_FUNC_BASIC = 0,
+    /**< Basic compress and decompress */
+    QZ_FUNC_CHAINING,
+    /**< Chaining compress */
+    QZ_FUNC_HASH
+    /**< Hash verify */
+} QzFuncMode_T;
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Async QATZIP Session opaque data storage
+ *
+ * @description
+ *      This structure contains a pointer to a structure with
+ *    session state.
+ *
+ *****************************************************************************/
+typedef struct AQzSession_S {
+    signed long int hw_session_stat;
+    /**< Filled in during initialization, session startup and decompression */
+    int thd_sess_stat;
+    /**< Note process compression and decompression thread state */
+    void *internal;
+    /**< Session data is opaque to outside world */
+    unsigned long total_in;
+    /**< Total processed input data length in this session */
+    unsigned long total_out;
+    /**< Total output data length in this session */
+    QzFuncMode_T func_mode;
+    /**< Note process basic and chaining operation state */
+    void *aqz_sess_params;
+    /**< Async session data is opaque to outside world */
+} AQzSession_T;
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Async QATZIP Session Initialization parameters
+ *
+ * @description
+ *      This structure contains data for initializing a session.
+ *
+ *****************************************************************************/
+typedef struct AQzSessionParams_S {
+    unsigned char sw_backup;
+    unsigned int hw_buff_sz;
+    unsigned int cy_priority;
+    /**< Priority of this session */
+    unsigned int cy_sym_operation;
+    /**< Operation to perfom */
+    unsigned int cy_hash_algorithm;
+    /**< Hash algorithm. For mode CPA_CY_SYM_MODE_HASH_NESTED, this is the
+     * inner hash algorithm. */
+    unsigned int cy_hash_mode;
+    /**< Mode of the hash operation. Valid options include plain, auth or
+     * nested hash mode. */
+    uint32_t cy_digest_result_lenInBytes;
+    /**< Length of the digest to be returned*/
+    uint32_t cy_digest_isappended;
+    /**< Flag indicating whether the digest is appended immediately*/
+    uint32_t cy_verify_digest;
+    /**< This flag is relevant only for operations which generate a message digest*/
+    uint32_t sw_hash;
+} AQzSessionParams_T;
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Async QATZIP Initialization parameters
+ *
+ * @description
+ *      This structure contains data for initializing threads and queues.
+ *
+ *****************************************************************************/
+typedef struct AQzInitParams_S {
+    int queue_sz;
+    /**< EnQueue and OutQueue size */
+    int num_thread;
+    /**< Note process compression and decompression number of thread pairs */
+    int submitrq_count;
+
+    int callback_count;
+
+    uint32_t sw_mode;
+} AQzInitParams_T;
+
+#define AQZ_NO_SPACE                     (-200)
+
+#define AQZ_CY_PRIORITY_DEFAULT          (1)
+#define AQZ_CY_PRIORITY_HIGH             (2)
+#define AQZ_CY_SYM_OP_ALGORITHM_CHAINING (3)
+#define AQZ_CY_SYM_OP_DEFAULT            (2)
+#define AQZ_CY_SYM_HASH_SHA3_256         (16)
+#define AQZ_CY_SYM_HASH_MODE_NESTED      (2)
+#define AQZ_CY_SYM_HASH_DEFAULT          (4)
+#define AQZ_CY_SYM_HASH_MODE_PLAIN       (1)
+#define AQZ_DIGEST_RESULT_BYTE_LENGTH    32
+#define AQZ_THREAD_QUEUE_DEFAULT         1
+#define AQZ_QUEUE_SIZE_DEFAULT           1000
+#define AQZ_SUBMIT_REQUEST_MANAGE_COUNT  1
+#define AQZ_CALLBACK_MANAGE_COUNT        1
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Initialize QAT hardware
+ *
+ * @description
+ *      This function initializes the QAT hardware.
+ *    This function is optional in the function calling sequence. If
+ *    desired, this call can be made to avoid latency impact during the
+ *    first call to aqzDecompress or aqzCompress, or to set the sw_backup
+ *    parameter explicitly.
+ *    The input parameter sw_backup specifies the behavior of the function
+ *    and that of the functions called with the same session in the event
+ *    there are insufficient resources to establish a QAT based compression
+ *    or decompression session.
+ *
+ *    The required resources include access to the QAT hardware, contiguous
+ *    pinned memory for mapping the hardware rings, and contiguous
+ *    pinned memory for buffers.
+ *
+ * @context
+ *      This function shall not be called in an interrupt context.
+ * @assumptions
+ *      None
+ * @sideEffects
+ *    This function will:
+ *      1) start the user space driver if necessary
+ *      2) allocate all hardware instances available
+ * @blocking
+ *      Yes
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in]       sess           Session handle
+ *                                 (pointer to opaque instance and session data.)
+ * @param[in]       params         initialize paramter
+ *                                 (pointer to opaque thread and queue data.)
+ * @param[in]       sw_backup      0 for no isa-l backup, 1 for isa-l backup
+ *
+ * @retval QZ_OK                   Function executed successfully. A hardware
+ *                                 or software instance has been allocated to
+ *                                 the calling process/thread
+ * @retval QZ_DUPLICATE            This process/thread already has a hardware
+ *                                 instance
+ * @retval QZ_PARAMS               *sess is NULL
+ * @retval QZ_NOSW_NO_HW           No hardware and no software session being
+ *                                 established
+ * @retval QZ_NOSW_NO_MDRV         No memory driver. No software session
+ *                                 established
+ * @retval QZ_NOSW_NO_INST_ATTACH  No instance available
+ *                                 No software session established
+ * @retval QZ_NOSW_LOW_MEM         Not enough pinned memory available
+ *                                 No software session established
+ *
+ * @pre
+ *      None
+ * @post
+ *      None
+ * @note
+ *      Only an asynchronous version of this function is provided.
+ *
+ * @see
+ *      None
+ *
+ *****************************************************************************/
+QATZIP_API int aqzInit(AQzSession_T *sess, AQzInitParams_T *params, unsigned char sw_backup);
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Initialize a Async QATZip session
+ *
+ * @description
+ *      This function establishes a QAT session. This involves associating
+ *    a hardware instance to the session, allocating buffers. If all of
+ *    these activities can not be completed successfully, then this function
+ *    will set up a software based session of param->sw_backup that is set to 1.
+ *
+ *    Before this function is called, the hardware must have been
+ *    successfully started via aqzInit.
+ *
+ *    If *sess includes an existing hardware or software session, then this
+ *    session will be torn down before a new one is attempted.
+ *
+ * @context
+ *      This function shall not be called in an interrupt context.
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @blocking
+ *      Yes
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in]       sess           Session handle
+ *                                 (pointer to opaque instance and session data)
+ * @param[in]       qz_params      Parameters for sync session
+ * @param[in]       aqz_params     Parameters for async session
+ *
+ *
+ * @retval QZ_OK                   Function executed successfully. A hardware
+ *                                 or software based compression session has been
+ *                                 created
+ * @retval QZ_PARAMS               *sess is NULL or member of params is invalid
+ * @retval QZ_NOSW_NO_HW           No hardware and no sw session being
+ *                                 established
+ * @retval QZ_NOSW_NO_MDRV         No memory driver. No software session
+ *                                 established
+ * @retval QZ_NOSW_NO_INST_ATTACH  No instance available
+ *                                 No software session established
+ * @retval QZ_NO_LOW_MEM           Not enough pinned memory available
+ *                                 No software session established
+ *
+ * @pre
+ *      None
+ * @post
+ *      None
+ * @note
+ *      Only an asynchronous version of this function is provided.
+ *
+ * @see
+ *      None
+ *
+ *****************************************************************************/
+QATZIP_API int aqzSetupSession(AQzSession_T *sess, QzSessionParams_T *qz_params, AQzSessionParams_T *aqz_params);
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Initialize Async QATzip preset memory
+ *
+ * @description
+ *      This function will initialize async qatzip preset memory if either a 
+ *    hardware based session or a software based session is available. 
+ *
+ * @context
+ *      This function shall not be called in an interrupt context.
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @blocking
+ *      Yes
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in]       sess     Session handle
+ *                           (pointer to opaque instance and session data)
+ *
+ * @retval QZ_OK             Function executed successfully
+ * @retval QZ_FAIL           Function did not succeed
+ * @retval QZ_PARAMS         *sess is NULL or member of params is invalid
+ * @pre
+ *      None
+ * @post
+ *      None
+ * @note
+ *      Only an asynchronous version of this function is provided.
+ *
+ * @see
+ *      None
+ *
+ *****************************************************************************/
+QATZIP_API int aqzInitMem(AQzSession_T *sess);
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Compress a buffer
+ *
+ * @description
+ *      This function will compress a buffer if either a hardware based
+ *    session or a software based session is available.
+ *
+ *    The resulting compressed block of data will be composed of one or more
+ *    gzip blocks per RFC 1952.
+ *
+ *    The caller must check the updated src_len.  This value will be the
+ *    number of consumed bytes on exit.  The calling API may have to
+ *    process the destination  buffer and call again.
+ *
+ *    The parameter dest_len will be set to the number of bytes produced in
+ *    the destination buffer.  This value may be zero if no data was produced
+ *    which may occur if the consumed data is retained internally. A
+ *    possible reason for this may be small amounts of data in the src
+ *    buffer.
+ *
+ * @context
+ *      This function shall not be called in an interrupt context.
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @blocking
+ *      Yes
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in]       sess        Session handle
+ *                              (pointer to opaque instance and session data)
+ * @param[in]       src         Point to source buffer
+ * @param[in]       src_len     Length of source buffer. Modified to number
+ *                              of bytes consumed
+ * @param[in]       dest        Point to destination buffer
+ * @param[in]       dest_len    Length of destination buffer. Modified
+ *                              to length of compressed data
+ * @param[in]       user_info   User-defined area, this data is returned in
+ *                              callback
+ * @param[in]       inst        Specify driver instance to perform compression
+ *                              (- 1, unspecified)
+ * @param[out]      callbackFn  Function pointer, return execution result
+ * 
+ * @retval QZ_OK                Function executed successfully
+ * @retval QZ_FAIL              Function did not succeed
+ * @retval QZ_PARAMS            *sess is NULL or member of params is invalid
+ * @pre
+ *      None
+ * @post
+ *      None
+ * @note
+ *      Only an asynchronous version of this function is provided.
+ *
+ * @see
+ *      None
+ *
+ *****************************************************************************/
+QATZIP_API int aqzCompress(AQzSession_T *sess, const unsigned char *src,
+                           unsigned int src_len, unsigned char *dest,
+                           unsigned int dest_len, void *user_info,
+                           int inst, AQzFunc_t callbackFn);
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Compress a buffer and return the CRC checksum
+ *
+ * @description
+ *      This function will compress a buffer if either a hardware based
+ *    session or a software based session is available.
+ *
+ *    The resulting compressed block of data will be composed of one or more
+ *    gzip blocks per RFC 1952.
+ *
+ *    This function will place completed compression blocks in the output
+ *    buffer and put CRC32 checksum for compressed input data in user provided
+ *    buffer *crc.
+ *
+ *    The caller must check the updated src_len. This value will be the
+ *    number of consumed bytes on exit.  The calling API may have to
+ *    process the destination  buffer and call again.
+ *
+ *    The parameter dest_len will be set to the number of bytes produced in
+ *    the destination buffer.  This value may be zero if no data was produced
+ *    which may occur if the consumed data is retained internally. A
+ *    possible reason for this may be small amounts of data in the src
+ *    buffer.
+ *
+ * @context
+ *      This function shall not be called in an interrupt context.
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @blocking
+ *      Yes
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in]       sess        Session handle
+ *                              (pointer to opaque instance and session data)
+ * @param[in]       src         Point to source buffer
+ * @param[in]       src_len     Length of source buffer. Modified to number
+ *                              of bytes consumed
+ * @param[in]       dest        Point to destination buffer
+ * @param[in]       dest_len    Length of destination buffer. Modified
+ *                              to length of compressed data
+ * @param[in]       user_info   User-defined area, this data is returned in
+ *                              callback
+ * @param[in]       crc         Point to CRC32 checksum buffer
+ * @param[in]       inst        Specify driver instance to perform compression
+ *                              (- 1, unspecified
+ * @param[out]      callbackFn  Function pointer, return execution result
+ *
+ * @retval QZ_OK                Function executed successfully
+ * @retval QZ_FAIL              Function did not succeed
+ * @retval QZ_PARAMS            *sess is NULL or member of params is invalid
+ * @pre
+ *      None
+ * @post
+ *      None
+ * @note
+ *      Only an asynchronous version of this function is provided.
+ *
+ * @see
+ *      None
+ *
+ *****************************************************************************/
+QATZIP_API int aqzCompressCrc(AQzSession_T *sess, const unsigned char *src,
+                              unsigned int src_len, unsigned char *dest,
+                              unsigned int dest_len, void *user_info,
+                              unsigned long *crc, int inst, AQzFunc_t callbackFn);
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Decompress a buffer
+ *
+ * @description
+ *      This function will decompress a buffer if either a hardware based
+ *    session or a software based session is available.
+ *
+ *    The input compressed block of data will be composed of one or more
+ *    gzip blocks per RFC 1952.
+ *
+ * @context
+ *      This function shall not be called in an interrupt context.
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @blocking
+ *      Yes
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in]     sess         Session handle
+ *                             (pointer to opaque instance and session data)
+ * @param[in]     src          Point to source buffer
+ * @param[in]     src_len      Length of source buffer. Modified to
+ *                             length of processed compressed data
+ * @param[in]     dest         Point to destination buffer
+ * @param[in]     dest_len     Length of destination buffer. Modified
+ *                             to length of decompressed data
+ * @param[in]     user_info    User-defined area, this data is returned in
+ *                             callback
+ * @param[in]     inst         Specify driver instance to perform compression
+ *                             (- 1, unspecified
+ * @param[out]    callbackFn   Function pointer, return execution result
+ *
+ * @retval QZ_OK               Function executed successfully
+ * @retval QZ_FAIL             Function did not succeed
+ * @retval QZ_PARAMS           *sess is NULL or member of params is invalid
+ * @pre
+ *      None
+ * @post
+ *      None
+ * @note
+ *      Only an asynchronous version of this function is provided.
+ *
+ * @see
+ *      None
+ *
+ *****************************************************************************/
+QATZIP_API int aqzDecompress(AQzSession_T *sess, const unsigned char *src,
+                             unsigned int src_len, unsigned char *dest,
+                             unsigned int dest_len, void *user_info,
+                             int inst, AQzFunc_t callbackFn);
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Compress a buffer
+ *
+ * @description
+ *      This function will compress a buffer if either a hardware based
+ *    session or a software based session is available.
+ *
+ *    The resulting compressed block of data will be composed of one or more
+ *    gzip blocks per RFC 1952.
+ *
+ *    The caller must check the updated src_len.  This value will be the
+ *    number of consumed bytes on exit.  The calling API may have to
+ *    process the destination  buffer and call again.
+ *
+ *    The parameter dest_len will be set to the number of bytes produced in
+ *    the destination buffer.  This value may be zero if no data was produced
+ *    which may occur if the consumed data is retained internally. A
+ *    possible reason for this may be small amounts of data in the src
+ *    buffer.
+ *
+ * @context
+ *      This function shall not be called in an interrupt context.
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @blocking
+ *      Yes
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in]       sess        Session handle
+ *                              (pointer to opaque instance and session data)
+ * @param[in]       src         Point to source buffer
+ * @param[in]       src_len     Length of source buffer. Modified to number
+ *                              of bytes consumed
+ * @param[in]       dest        Point to destination buffer
+ * @param[in]       dest_len    Length of destination buffer. Modified
+ *                              to length of compressed data
+ * @param[in]       user_info   User-defined area, this data is returned in
+ *                              callback
+ * @param[in]       inst        Specify driver instance to perform compression
+ *                              (- 1, unspecified
+ * @param[out]      callbackFn  Function pointer, return execution result
+ * 
+ * @retval QZ_OK                Function executed successfully
+ * @retval QZ_FAIL              Function did not succeed
+ * @retval QZ_PARAMS            *sess is NULL or member of params is invalid
+ * @pre
+ *      None
+ * @post
+ *      None
+ * @note
+ *      Only an asynchronous version of this function is provided.
+ *
+ * @see
+ *      None
+ *
+ *****************************************************************************/
+QATZIP_API int aqzChainCompress(AQzSession_T *sess, const unsigned char *src,
+                                unsigned int src_len, unsigned char *dest,
+                                unsigned int dest_len, void *user_info, unsigned int last,
+                                int inst, AQzFunc_t callbackFn);
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Decompress a buffer
+ *
+ * @description
+ *      This function will decompress a buffer if either a hardware based
+ *    session or a software based session is available.
+ *
+ *    The input compressed block of data will be composed of one or more
+ *    gzip blocks per RFC 1952.
+ *
+ * @context
+ *      This function shall not be called in an interrupt context.
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @blocking
+ *      Yes
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in]     sess         Session handle
+ *                             (pointer to opaque instance and session data)
+ * @param[in]     src          Point to source buffer
+ * @param[in]     src_len      Length of source buffer. Modified to
+ *                             length of processed compressed data
+ * @param[in]     dest         Point to destination buffer
+ * @param[in]     dest_len     Length of destination buffer. Modified
+ *                             to length of decompressed data
+ * @param[in]     user_info    User-defined area, this data is returned in
+ *                             callback
+ * @param[in]     inst         Specify driver instance to perform compression
+ *                             (- 1, unspecified
+ * @param[out]    callbackFn   Function pointer, return execution result
+ *
+ * @retval QZ_OK               Function executed successfully
+ * @retval QZ_FAIL             Function did not succeed
+ * @retval QZ_PARAMS           *sess is NULL or member of params is invalid
+ * @pre
+ *      None
+ * @post
+ *      None
+ * @note
+ *      Only an asynchronous version of this function is provided.
+ *
+ * @see
+ *      None
+ *
+ *****************************************************************************/
+QATZIP_API int aqzChainDecompress(AQzSession_T *sess, const unsigned char *src,
+                                  unsigned int src_len, unsigned char *dest,
+                                  unsigned int dest_len, void *user_info,
+                                  int inst, AQzFunc_t callbackFn);
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Initialize QAT hardware
+ *
+ * @description
+ *      This function initializes the QAT hardware.
+ *    This function is optional in the function calling sequence. If
+ *    desired, this call can be made to avoid latency impact during the
+ *    first call to aqzHash, or to set the sw_backup
+ *    parameter explicitly.
+ *    The input parameter sw_backup specifies the behavior of the function
+ *    and that of the functions called with the same session in the event
+ *    there are insufficient resources to establish a QAT based hash session.
+ *
+ *    The required resources include access to the QAT hardware, contiguous
+ *    pinned memory for mapping the hardware rings, and contiguous
+ *    pinned memory for buffers.
+ *
+ * @context
+ *      This function shall not be called in an interrupt context.
+ * @assumptions
+ *      None
+ * @sideEffects
+ *    This function will:
+ *      1) start the user space driver if necessary
+ *      2) allocate all hardware instances available
+ * @blocking
+ *      Yes
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in]       sess           Session handle
+ *                                 (pointer to opaque instance and session data.)
+ * @param[in]       params         initialize paramter
+ *                                 (pointer to opaque thread and queue data.)
+ * @param[in]       sw_backup      0 for no isa-l backup, 1 for isa-l backup
+ *
+ * @retval QZ_OK                   Function executed successfully. A hardware
+ *                                 or software instance has been allocated to
+ *                                 the calling process/thread
+ * @retval QZ_DUPLICATE            This process/thread already has a hardware
+ *                                 instance
+ * @retval QZ_PARAMS               *sess is NULL
+ * @retval QZ_NOSW_NO_HW           No hardware and no software session being
+ *                                 established
+ * @retval QZ_NOSW_NO_MDRV         No memory driver. No software session
+ *                                 established
+ * @retval QZ_NOSW_NO_INST_ATTACH  No instance available
+ *                                 No software session established
+ * @retval QZ_NOSW_LOW_MEM         Not enough pinned memory available
+ *                                 No software session established
+ *
+ * @pre
+ *      None
+ * @post
+ *      None
+ * @note
+ *      Only an asynchronous version of this function is provided.
+ *
+ * @see
+ *      None
+ *
+ *****************************************************************************/
+QATZIP_API int aqzSyInit(AQzSession_T *sess, AQzInitParams_T *params, unsigned char sw_backup);
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Initialize an Async QATZip Hash session
+ *
+ * @description
+ *      This function establishes a QAT hash session. This involves associating
+ *    a hardware instance to the session, allocating buffers. If all of
+ *    these activities can not be completed successfully, then this function
+ *    will set up a software based session of param->sw_backup that is set to 1.
+ *
+ *    Before this function is called, the hardware must have been
+ *    successfully started via aqzSyInit.
+ *
+ *    If *sess includes an existing hardware or software session, then this
+ *    session will be torn down before a new one is attempted.
+ *
+ * @context
+ *      This function shall not be called in an interrupt context.
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @blocking
+ *      Yes
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in]       sess           Session handle
+ *                                 (pointer to opaque instance and session data)
+ * @param[in]       aqz_params     Parameters for async session
+ *
+ *
+ * @retval QZ_OK                   Function executed successfully. A hardware
+ *                                 or software based compression session has been
+ *                                 created
+ * @retval QZ_PARAMS               *sess is NULL or member of params is invalid
+ * @retval QZ_NOSW_NO_HW           No hardware and no sw session being
+ *                                 established
+ * @retval QZ_NOSW_NO_MDRV         No memory driver. No software session
+ *                                 established
+ * @retval QZ_NOSW_NO_INST_ATTACH  No instance available
+ *                                 No software session established
+ * @retval QZ_NO_LOW_MEM           Not enough pinned memory available
+ *                                 No software session established
+ *
+ * @pre
+ *      None
+ * @post
+ *      None
+ * @note
+ *      Only an asynchronous version of this function is provided.
+ *
+ * @see
+ *      None
+ *
+ *****************************************************************************/
+QATZIP_API int aqzSetupSySession(AQzSession_T *sess, AQzSessionParams_T *aqz_params);
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Hash a buffer and return the digest checksum
+ *
+ * @description
+ *      This function will hash a buffer if either a hardware based
+ *    session or a software based session is available.
+ *
+ *    The caller must check the updated src_len. This value will be the
+ *    number of consumed bytes on exit.  The calling API may have to
+ *    process the destination  buffer and call again.
+ *
+ *    The parameter dest_len will be set to the number of bytes produced in
+ *    the destination buffer.  This value may be zero if no data was produced
+ *    which may occur if the consumed data is retained internally. A
+ *    possible reason for this may be small amounts of data in the src
+ *    buffer.
+ *
+ * @context
+ *      This function shall not be called in an interrupt context.
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @blocking
+ *      Yes
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in]       sess        Session handle
+ *                              (pointer to opaque instance and session data)
+ * @param[in]       src         Point to source buffer
+ * @param[in]       src_len     Length of source buffer. Modified to number
+ *                              of bytes consumed
+ * @param[in]       dest        Point to destination buffer
+ * @param[in]       dest_len    Length of destination buffer. Modified
+ *                              to length of compressed data
+ * @param[in]       user_info   User-defined area, this data is returned in
+ *                              callback
+ * @param[in]       inst        Specify driver instance to perform compression
+ *                              (- 1, unspecified
+ * @param[out]      callbackFn  Function pointer, return execution result
+ *
+ * @retval QZ_OK                Function executed successfully
+ * @retval QZ_FAIL              Function did not succeed
+ * @retval QZ_PARAMS            *sess is NULL or member of params is invalid
+ * @pre
+ *      None
+ * @post
+ *      None
+ * @note
+ *      Only an asynchronous version of this function is provided.
+ *
+ * @see
+ *      None
+ *
+ *****************************************************************************/
+QATZIP_API int aqzHash(AQzSession_T *sess, const unsigned char *src,
+                       unsigned int src_len, unsigned char *dest,
+                       unsigned int dest_len, void *user_info,
+                       int inst, AQzFunc_t callbackFn);
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Deinitialize a QATZip session
+ *
+ * @description
+ *      This function disconnects a session from a hardware instance and
+ *    deallocates buffers. If no session has been initialized, then no
+ *    action will take place.
+ *
+ * @context
+ *      This function shall not be called in an interrupt context.
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @blocking
+ *      Yes
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in]       sess  Session handle
+ *                        (pointer to opaque instance and session data)
+ *
+ * @retval QZ_OK          Function executed successfully
+ * @retval QZ_FAIL        Function did not succeed
+ * @retval QZ_PARAMS      *sess is NULL or member of params is invalid
+ *
+ * @pre
+ *      None
+ * @post
+ *      None
+ * @note
+ *      Only an asynchronous version of this function is provided.
+ *
+ * @see
+ *      None
+ *
+ *****************************************************************************/
+QATZIP_API int aqzTeardownSession(AQzSession_T *sess);
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Terminates a QATZip session
+ *
+ * @description
+ *      This function closes the connection with QAT.
+ *
+ * @context
+ *      This function shall not be called in an interrupt context
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @blocking
+ *      Yes
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in]       sess  Session handle
+ *                        (pointer to opaque instance and session data)
+ *
+ * @retval QZ_OK          Function executed successfully
+ * @retval QZ_FAIL        Function did not succeed
+ * @retval QZ_PARAMS      *sess is NULL or member of params is invalid
+ *
+ * @pre
+ *      None
+ * @post
+ *      None
+ * @note
+ *      Only an asynchronous version of this function is provided.
+ *
+ * @see
+ *      None
+ *
+ *****************************************************************************/
+QATZIP_API int aqzClose(AQzSession_T *sess);
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Get default AQzSessionParams_T value
+ *
+ * @description
+ *      Get default AQzSessionParams_T value.
+ *
+ * @context
+ *      This function shall not be called in an interrupt context.
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @blocking
+ *      Yes
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in]   defaults   The pointer to default value
+ *
+ * @retval      QZ_OK      Get default value successfully
+ * @retval      QZ_PARAM   Fail to get default value
+ *
+ * @pre
+ *      None
+ * @post
+ *      None
+ * @note
+ *      Only an asynchronous version of this function is provided.
+ *
+ * @see
+ *      None
+ *
+ *****************************************************************************/
+QATZIP_API int aqzSetDefaults(AQzSessionParams_T *defaults);
+
+QATZIP_API int aqzGetDefaults(AQzSessionParams_T *defaults);
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Get default AQzInitParams_T value
+ *
+ * @description
+ *      Get default AQzInitParams_T value.
+ *
+ * @context
+ *      This function shall not be called in an interrupt context.
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @blocking
+ *      Yes
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in]   defaults   The pointer to default value
+ *
+ * @retval      QZ_OK      Get default value successfully
+ * @retval      QZ_PARAM   Fail to get default value
+ *
+ * @pre
+ *      None
+ * @post
+ *      None
+ * @note
+ *      Only an asynchronous version of this function is provided.
+ *
+ * @see
+ *      None
+ *
+ *****************************************************************************/
+QATZIP_API int aqzGetInitDefaults(AQzInitParams_T *defaults);
+
+/**
+ *****************************************************************************
+ * @ingroup qatZip
+ *      Allocate different types of memory
+ *
+ * @description
+ *      Allocate different types of memory.
+ *
+ * @context
+ *      This function shall not be called in an interrupt context.
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @blocking
+ *      Yes
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in]       sz                  Memory size to be allocated
+ * @param[in]       numa                NUMA node from which to allocate memory
+ * @param[in]       force_pinned        PINNED_MEM allocate contiguous memory
+ *                                      COMMON_MEM allocate non-contiguous memory
+ *
+ * @retval          NULL                Fail to allocate memory
+ * @retval          address             The address of allocated memory
+ *
+ * @pre
+ *      None
+ * @post
+ *      None
+ * @note
+ *      Only an asynchronous version of this function is provided.
+ *
+ * @see
+ *      None
+ *
+ *****************************************************************************/
+QATZIP_API void *aqzMalloc(size_t sz, int numa, int force_pinned);
+
+typedef struct AQzQueueHeader_S {
+     int inst_hint;
+     int mem_hint;
+     QzDataFormat_T data_fmt;
+     QzDirection_T dir;
+     unsigned char *src;
+     unsigned int src_sz;
+     unsigned char *next_dest;
+     unsigned char *next_digest;
+     unsigned int dest_sz;
+     unsigned long *crc32;
+     unsigned long qz_in_len;
+     unsigned long qz_out_len;
+     unsigned long digest_len;
+     unsigned char sw_backup;
+     void *user_info;
+     AQzFunc_t callbackFn;
+ 	QzFuncMode_T func_mode;
+     unsigned int hashAlg;
+     unsigned int last;
+     char sw_mode;
+ } AQzQueueHeader_T;
+
 #ifdef __cplusplus
 }
 #endif

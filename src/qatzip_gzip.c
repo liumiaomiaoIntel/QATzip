@@ -242,4 +242,64 @@ unsigned char *findStdGzipFooter(const unsigned char *src_ptr,
     return (void *)((unsigned char *)src_ptr + src_avail_len - stdGzipFooterSz());
 }
 
+void aqzOutputHeaderGen(unsigned char *ptr,
+                        void *res,
+                        QzDataFormat_T data_fmt,
+                        QzFuncMode_T func_mode)
+{
+    QZ_DEBUG("Generate header\n");
+
+    switch (data_fmt) {
+    case QZ_DEFLATE_RAW:
+        break;
+    case QZ_DEFLATE_GZIP:
+        stdGzipHeaderGen(ptr, (CpaDcRqResults*)res);
+        break;
+    case QZ_DEFLATE_GZIP_EXT:
+    default:
+        if (QZ_FUNC_BASIC == func_mode) {
+            qzGzipHeaderGen(ptr, (CpaDcRqResults *)res);        
+        }
+        /*if (QZ_FUNC_CHAINING == func_mode) {
+            aqzGzipHeaderGen(ptr, (CpaDcChainRqResults *)res);
+        } else if (QZ_FUNC_BASIC == func_mode) {
+            qzGzipHeaderGen(ptr, (CpaDcRqResults *)res);
+        }*/
+        break;
+    }
+}
+
+void aqzGzipFooterGen(unsigned char *ptr, void *res, QzFuncMode_T func_mode)
+{
+    assert(NULL != ptr);
+    assert(NULL != res);
+    //StdGzF_T *ftr;
+
+    if (QZ_FUNC_BASIC == func_mode) {
+        qzGzipFooterGen(ptr, (CpaDcRqResults *)res);
+    /*} else {
+        ftr = (StdGzF_T *)ptr;
+        ftr->crc32 = ((CpaDcChainRqResults *)(res))->crc32;
+        ftr->i_size = ((CpaDcChainRqResults *)(res))->consumed;*/
+    }
+}
+
+inline void aqzOutputFooterGen(unsigned char *next_dest,
+                               void *res,
+                               QzDataFormat_T data_fmt,
+                               QzFuncMode_T func_mode)
+{
+    QZ_DEBUG("Generate footer\n");
+
+    unsigned char *ptr = next_dest;
+    switch (data_fmt) {
+    case QZ_DEFLATE_RAW:
+        break;
+    case QZ_DEFLATE_GZIP_EXT:
+    default:
+        aqzGzipFooterGen(ptr, res, func_mode);
+        break;
+    }
+}
+
 #pragma pack(pop)

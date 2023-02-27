@@ -69,44 +69,26 @@ echo "platform=$platform"
 
 #Replace the driver configuration files and configure hugepages
 echo "Replace the driver configuration files and configure hugepages."
-if [[ $platform = "37c8" || $platform = "C62x" ]]
-then
-    process=24
-    \cp $CURRENT_PATH/config_file/c6xx/c6xx_dev0.conf /etc
-    \cp $CURRENT_PATH/config_file/c6xx/c6xx_dev1.conf /etc
-    \cp $CURRENT_PATH/config_file/c6xx/c6xx_dev2.conf /etc
-elif [ $platform = "DH895XCC" ]
-then
-    process=8
-    \cp $CURRENT_PATH/config_file/dh895xcc/dh895xcc_dev0.conf /etc
-elif [ $platform = "4940" ]
-then
-    process=1
-    \cp $CURRENT_PATH/config_file/4xxx_16/4xxx*.conf /etc
-elif [ $platform = "C3000" ]
-then
-    process=4
-    \cp $CURRENT_PATH/config_file/c3xxx/c3xxx_dev0.conf /etc
-fi
+process=1
+\cp $CURRENT_PATH/config_file/4xxx_16/4xxx*.conf /etc
+
 service qat_service restart
-echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+echo 2048 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 rmmod usdm_drv
-insmod $ICP_ROOT/build/usdm_drv.ko max_huge_pages=1024 max_huge_pages_per_process=24
+insmod $ICP_ROOT/build/usdm_drv.ko max_huge_pages=2048 max_huge_pages_per_process=1024
 sleep 5
 
 #Perform performance test
 echo "Perform performance test"
-thread=4
-if [ $platform = "4940" ]
-then
-    thread=16
-fi
 
+thread=16
+Buffersz=65536
+Testfile=/opt/compressdata/calgary
 echo > result_comp
 cpu_list=0
 for((numProc_comp = 0; numProc_comp < $process; numProc_comp ++))
 do
-    taskset -c $cpu_list $QZ_ROOT/test/test -m 4 -l 1000 -t $thread -D comp >> result_comp 2>> result_comp_stderr &
+    taskset -c $cpu_list $QZ_ROOT/test/test -m 4 -l 1000 -t $thread -D comp -B 0 -i $Testfile -C $Buffersz >> result_comp 2>> result_comp_stderr &
     cpu_list=$(($cpu_list + 1))
 done
 wait
@@ -117,7 +99,7 @@ echo > result_decomp
 cpu_list=0
 for((numProc_decomp = 0; numProc_decomp < $process; numProc_decomp ++))
 do
-    taskset -c $cpu_list $QZ_ROOT/test/test -m 4 -l 1000 -t $thread -D decomp >> result_decomp 2>> result_decomp_stderr &
+    taskset -c $cpu_list $QZ_ROOT/test/test -m 4 -l 1000 -t $thread -D decomp -B 0 -i $Testfile -C $Buffersz >> result_decomp 2>> result_decomp_stderr &
     cpu_list=$(($cpu_list + 1))
 done
 wait

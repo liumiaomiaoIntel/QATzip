@@ -565,8 +565,8 @@ int qzInit(QzSession_T *sess, unsigned char sw_backup)
     unsigned int dev_id = 0;
     QzHardware_T *qat_hw = NULL;
     unsigned int instance_found = 0;
-    static atomic_int waiting = 0;
-    static atomic_int wait_cnt = 0;
+    static int waiting = 0;
+    static int wait_cnt = 0;
 #ifdef ADF_PCI_API
     Cpa32U pcie_count = 0;
 #endif
@@ -3414,4 +3414,1898 @@ int qzGetSoftwareComponentVersionList(QzSoftwareVersionInfo_T *api_info,
 {
     QZ_ERROR("qatzip don't support qzGetSoftwareComponentVersionList API yet!\n");
     return QZ_FAIL;
+}
+
+
+//aqatzip
+
+__thread AQzIndex_T g_instance_index = {
+    .pid = 0,
+    .tid = 0,
+    .index = 0
+};
+
+AProcessData_T g_aqzprocess = {
+    .num_thread = AQZ_THREAD_QUEUE_DEFAULT,
+    .aqz_thread_activity = CPA_FALSE,
+    .submitrq_count = AQZ_SUBMIT_REQUEST_MANAGE_COUNT,
+    .callback_count   = AQZ_CALLBACK_MANAGE_COUNT,
+    .aqz_thread_status = QZ_NONE,
+    .qz_init_status = QZ_NONE,
+    .qat_available = QZ_NONE,
+    .qz_sy_init_status = QZ_NONE
+};
+
+static void aqz_swapDataBuffer(unsigned long i, int j)
+{
+    Cpa8U *tmp_data;
+
+    tmp_data = g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->pData;
+    g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->pData =
+        g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->pData;
+    g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->pData = tmp_data;
+}
+
+static int aqz_callbackResults(CpaStatus stat, int i, int j)
+{
+    if (g_aqzprocess.aqz_inst[i].stream[j].src1 !=
+        g_aqzprocess.aqz_inst[i].stream[j].src2) {
+        goto print_err;
+    }
+
+    if (g_aqzprocess.aqz_inst[i].stream[j].sink1 !=
+        g_aqzprocess.aqz_inst[i].stream[j].sink2) {
+        goto print_err;
+    }
+
+    if (g_aqzprocess.aqz_inst[i].stream[j].src2 !=
+        (g_aqzprocess.aqz_inst[i].stream[j].sink1 + 1)) {
+        goto print_err;
+    }
+
+    g_aqzprocess.aqz_inst[i].stream[j].sink1++;
+    g_aqzprocess.aqz_inst[i].stream[j].job_status = stat;
+    goto done;
+
+print_err:
+    QZ_ERROR("aqz_callbackResults FLOW ERROR IN CBi %ld %ld\n", i, j);
+    return QZ_FAIL;
+done:
+    return QZ_OK;
+}
+
+static void doDcDpCallback(void *cbtag, CpaStatus stat)
+{
+    int i, j, rc;
+    AQzQueueHeader_T *aqz_header;
+
+    if (NULL == cbtag) {
+        return;
+    }
+    aqz_header = (AQzQueueHeader_T *)cbtag;
+    i = aqz_header->inst_hint;
+    j = aqz_header->mem_hint;
+
+    rc = aqz_callbackResults(stat, i, j);
+    if (rc == QZ_FAIL) {
+        return;
+    }
+    do {
+        rc = aqz_queuePush(&g_aqzprocess.aqz_queue[i].queue_o, g_aqzprocess.aqz_inst[i].queue_buffers[j]);
+        if (rc == AQZ_NO_SPACE) {
+            usleep(0);
+        }
+    } while (rc == AQZ_NO_SPACE);
+    return;
+}
+
+
+#define AQZ_INST_MEM_CHECK(ptr, i)                                    \
+    if (NULL == (ptr)) {                                             \
+        aqz_cleanUpInstMem((i));                                         \
+        rc = sw_backup ? QZ_LOW_MEM : QZ_NOSW_LOW_MEM;               \
+        goto done_inst;                                              \
+    }
+
+ /*   
+#define AQZ_CY_INST_MEM_CHECK(ptr, i)                                \
+    if (NULL == (ptr)) {                                             \
+        aqz_cleanUpCyInstMem((i));                                       \
+        rc = sw_backup ? QZ_LOW_MEM : QZ_NOSW_LOW_MEM;                 \
+        goto done_inst;                                              \
+    }
+*/
+#define AQZ_INIT_MEM_CHECK(ptr)                                    \
+    if (NULL == (ptr)) {                                           \
+        goto cleanup;                                              \
+    }
+
+#define AQZ_CPU_CORE_BIND_CHECK(rc)                                  \
+    if (QZ_OK != rc) {                                               \
+        goto cleanup;                                                \
+    }
+
+static void aqz_stopQat(void)
+{
+    if (NULL != g_aqzprocess.aqz_inst) {
+        free(g_aqzprocess.aqz_inst);
+        g_aqzprocess.aqz_inst = NULL;
+    }
+
+    aqz_cleanUpInitMem(g_aqzprocess.num_thread, g_aqzprocess.queue_sz);
+
+    g_aqzprocess.num_thread = (Cpa16U)1;
+    g_aqzprocess.queue_sz = (Cpa16U)32;
+    g_aqzprocess.aqz_thread_status = QZ_NONE;
+    g_aqzprocess.aqz_thread_activity = CPA_FALSE;
+}
+
+static void aqz_exitFunc(void)
+{
+    aqz_stopQat();
+    exitFunc();
+}
+
+#define AQZ_BACKOUT(hw_status)                                     \
+    aqz_stopQat();                                                 \
+    BACKOUT(hw_status);
+
+AQzSessionParams_T g_aqzsess_params_default = {
+    .sw_backup                      = QZ_SW_BACKUP_DEFAULT,
+    .hw_buff_sz                     = QZ_HW_BUFF_SZ,
+    .cy_priority                    = AQZ_CY_PRIORITY_DEFAULT,
+    .cy_sym_operation               = AQZ_CY_SYM_OP_DEFAULT,
+    .cy_hash_algorithm              = AQZ_CY_SYM_HASH_DEFAULT,
+    .cy_hash_mode                   = AQZ_CY_SYM_HASH_MODE_PLAIN,
+    .cy_digest_result_lenInBytes    = AQZ_DIGEST_RESULT_BYTE_LENGTH,
+    .cy_digest_isappended           = CPA_FALSE,
+    .cy_verify_digest               = CPA_FALSE
+};
+
+AQzInitParams_T g_aqzsess_init_params_default = {
+    .queue_sz         = AQZ_QUEUE_SIZE_DEFAULT,
+    .num_thread       = AQZ_THREAD_QUEUE_DEFAULT,
+    .submitrq_count   = AQZ_SUBMIT_REQUEST_MANAGE_COUNT,
+    .callback_count   = AQZ_CALLBACK_MANAGE_COUNT,
+    .sw_mode          = CPA_FALSE
+};
+
+static inline void pollingThreadExit(void)
+{
+    pthread_exit(NULL);
+}
+
+static void *aqz_submitRequestThread(void *in)
+{
+    int inst_index = ((AQzQueueInstance_T*)in)->inst;
+    int loopIndex = inst_index;
+    int i = -1, j =0, rc = QZ_OK;
+    AQzQueueInstance_T *instance;
+    AQzQueue_T *queue_i, *queue_o;
+    AQzQueueBufferList_T *aqz_out_data = NULL;
+    // int loopTimes = 0;
+    int start_index = inst_index / g_aqzprocess.submitrq_count * g_aqzprocess.submitrq_count;
+
+    while (0 == g_aqzprocess.aqz_queue[inst_index].stop_th) { 
+        loopIndex = loopIndex % g_aqzprocess.submitrq_count + start_index;
+        
+        instance = &g_aqzprocess.aqz_queue[loopIndex];
+        queue_i = &instance->queue_i;
+        queue_o = &instance->queue_o;
+
+        if (0 == queue_i->req && CPA_TRUE == g_aqzprocess.aqz_thread_activity) {
+            usleep(0);
+            // if (loopTimes == 100000) {
+            //     QZ_ERROR("thread needs to break down!\n");
+            //     g_aqzprocess.aqz_queue[inst_index].stop_th = 1;
+            // }
+            continue;
+        }
+        if (queue_i->req > queue_i->submit) { 
+            i = queue_i->tail;
+            if (QZ_FUNC_BASIC == queue_i->queue_buffers[i]->header.func_mode) {
+                if (QZ_DIR_COMPRESS == queue_i->queue_buffers[i]->header.dir) {
+                    aqz_doCompressIn(queue_i);
+                } else if (QZ_DIR_DECOMPRESS == queue_i->queue_buffers[i]->header.dir) {
+                    aqz_doDecompressIn(queue_i);
+                }
+            /*} else if (QZ_FUNC_CHAINING == queue_i->queue_buffers[i]->header.func_mode) {
+                if (QZ_DIR_COMPRESS == queue_i->queue_buffers[i]->header.dir) {
+                    aqz_doChainCompressIn(queue_i);
+                }*/
+            }
+
+        }
+
+        if (queue_o->req > queue_o->submit) {
+            aqz_out_data = queue_o->queue_buffers[queue_o->tail];
+
+            i = aqz_out_data->header.inst_hint;
+            j = aqz_out_data->header.mem_hint;
+
+            if (QZ_FUNC_BASIC ==aqz_out_data->header.func_mode) {
+                if (aqz_out_data->header.dir == QZ_DIR_COMPRESS) {
+                    rc = aqz_doCompressOut(aqz_out_data);
+                } else if (aqz_out_data->header.dir == QZ_DIR_DECOMPRESS) {
+                    rc = aqz_doDecompressOut(aqz_out_data);
+                }
+            /*} else if (QZ_FUNC_CHAINING == aqz_out_data->header.func_mode) {
+                if (aqz_out_data->header.dir == QZ_DIR_COMPRESS) {
+                    rc = aqz_doChainCompressOut(aqz_out_data);
+                }*/
+            }
+
+            if (aqz_out_data->header.callbackFn) {
+                aqz_out_data->header.callbackFn(rc, (void*)&aqz_out_data->header);
+            }
+            g_aqzprocess.aqz_inst[i].stream[j].sink2++;
+            aqz_queuePop(queue_o);
+        }
+        loopIndex++;
+    }
+    pollingThreadExit();
+
+    //return;
+    return ((void *) NULL);
+}
+
+// static void aqz_callbackThread(void *out)
+// {
+//     int i = 0, j, rc = QZ_OK;
+//     AQzQueueInstance_T *instance;
+//     AQzQueue_T *queue_i, *queue_o;
+//     AQzQueueBufferList_T *aqz_out_data = NULL;
+
+//     instance = (AQzQueueInstance_T *)out;
+//     instance->stop_th = 0;
+//     CpaStatus status = CPA_STATUS_SUCCESS;
+//     int loopIndex = instance->inst;
+//     int start_index = loopIndex / g_aqzprocess.callback_count * g_aqzprocess.callback_count;
+
+//     while (0 == instance->stop_th) {
+//         loopIndex = loopIndex % g_aqzprocess.callback_count + start_index;
+
+//         instance = &g_aqzprocess.aqz_queue[loopIndex];
+//         queue_i = &instance->queue_i;
+//         queue_o = &instance->queue_o;
+
+//         if (queue_i->submit != queue_o->req) {
+//             status = icp_sal_DcPollInstance(g_process.dc_inst_handle[loopIndex], 0);
+//             if (unlikely(CPA_STATUS_FAIL == status)) {
+//                 QZ_ERROR("Error in DcPoll: %d\n", status);
+//                 break;
+//             } else if (CPA_STATUS_RETRY == status) {
+//                 g_aqzprocess.aqz_inst[loopIndex].polling_idx = (g_aqzprocess.aqz_inst[loopIndex].polling_idx >= POLLING_LIST_NUM -1) ?
+//                                                        (POLLING_LIST_NUM -1) : g_aqzprocess.aqz_inst[loopIndex].polling_idx + 1;
+//                 QZ_DEBUG("comp sleep for %d usec...\n",
+//                         g_polling_interval[g_aqzprocess.aqz_inst[loopIndex].polling_idx]);
+//                 usleep(g_polling_interval[g_aqzprocess.aqz_inst[loopIndex].polling_idx]);
+//                 continue;
+//             } else {
+//                 g_aqzprocess.aqz_inst[loopIndex].polling_idx = (g_aqzprocess.aqz_inst[loopIndex].polling_idx == 0) ? (0) :
+//                                                        (g_aqzprocess.aqz_inst[loopIndex].polling_idx - 1);
+//             }
+
+//             while (queue_o->req > queue_o->submit) {
+//                 aqz_out_data = queue_o->queue_buffers[queue_o->tail];
+
+//                 i = aqz_out_data->header.inst_hint;
+//                 j = aqz_out_data->header.mem_hint;
+
+//                 if (QZ_FUNC_BASIC ==aqz_out_data->header.func_mode) {
+//                     if (aqz_out_data->header.dir == QZ_DIR_COMPRESS) {
+//                         rc = aqz_doCompressOut(aqz_out_data);
+//                     } else if (aqz_out_data->header.dir == QZ_DIR_DECOMPRESS) {
+//                         rc = aqz_doDecompressOut(aqz_out_data);
+//                     }
+//                 } else if (QZ_FUNC_CHAINING == aqz_out_data->header.func_mode) {
+//                     if (aqz_out_data->header.dir == QZ_DIR_COMPRESS) {
+//                         rc = aqz_doChainCompressOut(aqz_out_data);
+//                     }
+//                 }
+
+//                 if (aqz_out_data->header.callbackFn) {
+//                     aqz_out_data->header.callbackFn(rc, (void*)&aqz_out_data->header);
+//                 }
+//                 g_aqzprocess.aqz_inst[i].stream[j].sink2++;
+//                 aqz_queuePop(queue_o);
+//             }
+            
+//         } else {
+//             usleep(g_polling_interval[g_aqzprocess.aqz_inst[loopIndex].polling_idx]);
+//         }
+//         loopIndex++;
+//     }
+
+//     pollingThreadExit();
+
+//     return;
+// }
+
+static void *aqz_pollingThread(void *in) {
+    AQzQueueInstance_T *instance;
+    AQzQueue_T *queue_i;
+    // int loopTimes = 0;
+    CpaStatus status = CPA_STATUS_SUCCESS;
+    instance = (AQzQueueInstance_T *)in;
+    instance->stop_th = 0;
+    int loopIndex = instance->inst;
+    queue_i = &instance->queue_i;
+    int start_index = loopIndex / g_aqzprocess.callback_count * g_aqzprocess.callback_count;
+    while (0 == instance->stop_th) {
+        if (0 == queue_i->req && CPA_TRUE == g_aqzprocess.aqz_thread_activity) {
+            usleep(0);
+            continue;
+        }
+        if (g_aqzprocess.callback_count == g_process.num_instances) {
+            for (int i = 0; i < g_process.num_instances; i++) {
+                status = icp_sal_DcPollInstance(g_process.dc_inst_handle[i], 0);
+            }
+        } else {
+            loopIndex = loopIndex % g_aqzprocess.callback_count + start_index;
+            status = icp_sal_DcPollInstance(g_process.dc_inst_handle[loopIndex], 0);
+            if (CPA_STATUS_RETRY == status) {
+                usleep(0);
+            }
+            loopIndex++;
+        }
+        // } else {
+        //     loopIndex = loopIndex % g_aqzprocess.callback_count + start_index;
+        //     icp_sal_DcPollInstance(g_process.dc_inst_handle[loopIndex], 0);
+        //     loopIndex++;
+        // }
+
+    }
+
+    pollingThreadExit();
+
+    //return;
+    return ((void *) NULL);
+}
+
+int aqz_initParamsCheck(AQzInitParams_T *params)
+{
+    if (unlikely(!params)) {
+        return QZ_FAIL;
+    }
+
+    if (unlikely(params->queue_sz < 0                    ||
+        params->num_thread > g_process.num_instances     ||
+        params->num_thread < 0                           ||
+        params->submitrq_count > g_process.num_instances ||
+        params->submitrq_count < 0                       ||
+        params->sw_mode > 1                              ||
+        params->sw_mode < 0                              ||
+        params->callback_count > g_process.num_instances ||
+        params->callback_count < 0)) {
+        return QZ_FAIL;
+    }
+
+    return QZ_OK;
+}
+
+
+void aqz_cleanUpInitMem(int num, int sz)
+{
+    int i;
+    for (i = 0; i < num; i++) {
+        g_aqzprocess.aqz_queue[i].stop_th = 1;
+        qzFree(g_aqzprocess.aqz_queue[i].c_th_i);
+        qzFree(g_aqzprocess.aqz_queue[i].c_th_o);
+        qzFree(g_aqzprocess.aqz_queue[i].th_func);
+
+        if (NULL != g_aqzprocess.aqz_queue[i].queue_i.queue_buffers) {
+            free(g_aqzprocess.aqz_queue[i].queue_i.queue_buffers);
+            g_aqzprocess.aqz_queue[i].queue_i.queue_buffers = NULL;
+        }
+
+        if (NULL != g_aqzprocess.aqz_queue[i].queue_o.queue_buffers) {
+            free(g_aqzprocess.aqz_queue[i].queue_o.queue_buffers);
+            g_aqzprocess.aqz_queue[i].queue_i.queue_buffers = NULL;
+        }
+    }
+
+    if (NULL != g_aqzprocess.aqz_queue) {
+        free(g_aqzprocess.aqz_queue);
+        g_aqzprocess.aqz_queue = NULL;
+    }
+
+    g_aqzprocess.aqz_thread_status = QZ_NONE;
+    g_aqzprocess.aqz_thread_activity = CPA_FALSE;
+}
+
+static int aqz_initQueue(AQzInitParams_T *params, AQzSession_T *sess)
+{
+    int rc;
+    int i, thread_num, queue_sz;
+    unsigned int numa_node;
+
+    if (unlikely(NULL == params)) {
+        return QZ_PARAMS;
+    }
+
+    thread_num = g_process.num_instances;
+    
+    queue_sz = params->queue_sz;
+    g_aqzprocess.submitrq_count = params->submitrq_count;
+    g_aqzprocess.callback_count = params->callback_count;
+    g_aqzprocess.sw_mode = params->sw_mode;
+
+    g_aqzprocess.aqz_queue = malloc(thread_num * sizeof(AQzQueueInstance_T));
+    //g_aqzprocess.aqz_queue = calloc(1, thread_num * sizeof(AQzQueueInstance_T));
+    if (unlikely(NULL == g_aqzprocess.aqz_queue)) {
+        QZ_ERROR("malloc queue instance failed\n");
+        goto done;
+    }
+
+    for (i = 0; i < thread_num; i++) {
+        numa_node = g_process.qz_inst[i].instance_info.nodeAffinity < 0 ?
+                        NODE_0 : g_process.qz_inst[i].instance_info.nodeAffinity;
+        g_aqzprocess.aqz_queue[i].queue_th_setup = 0;
+        g_aqzprocess.aqz_queue[i].inst = i;
+        g_aqzprocess.aqz_queue[i].queue_idx = 0;
+
+        g_aqzprocess.aqz_queue[i].c_th_i = (pthread_t *)
+                                            qzMalloc(sizeof(pthread_t), numa_node, PINNED_MEM);
+        AQZ_INIT_MEM_CHECK(g_aqzprocess.aqz_queue[i].c_th_i);
+
+        g_aqzprocess.aqz_queue[i].c_th_o = (pthread_t *)
+                                            qzMalloc(sizeof(pthread_t), numa_node, PINNED_MEM);
+        AQZ_INIT_MEM_CHECK(g_aqzprocess.aqz_queue[i].c_th_o);
+
+        g_aqzprocess.aqz_queue[i].th_func = qzMalloc(2 * sizeof(AQzThFunc_t), numa_node, PINNED_MEM);
+        AQZ_INIT_MEM_CHECK(g_aqzprocess.aqz_queue[i].th_func);
+
+        g_aqzprocess.aqz_queue[i].th_func[0] = aqz_submitRequestThread;
+        g_aqzprocess.aqz_queue[i].th_func[1] = aqz_pollingThread;
+
+        aqz_queueInit(&g_aqzprocess.aqz_queue[i], queue_sz);
+
+        /*pthread_create(g_aqzprocess.aqz_queue[i].c_th_i, NULL, aqz_submitRequestThread, (void *)&g_aqzprocess.aqz_queue[i]);
+        pthread_create(g_aqzprocess.aqz_queue[i].c_th_o, NULL, aqz_pollingThread, (void *)&g_aqzprocess.aqz_queue[i]);
+        
+        rc = codeThreadBind(g_aqzprocess.aqz_queue[i].c_th_i, i, sess);
+        AQZ_CPU_CORE_BIND_CHECK(rc);
+
+        rc = codeThreadBind(g_aqzprocess.aqz_queue[i].c_th_o, i, sess);
+        AQZ_CPU_CORE_BIND_CHECK(rc);*/
+        
+        if (i % params->submitrq_count == params->submitrq_count-1) {
+            pthread_create(g_aqzprocess.aqz_queue[i].c_th_i, NULL, g_aqzprocess.aqz_queue[i].th_func[0], (void *)&g_aqzprocess.aqz_queue[i]);
+        }
+        if (g_aqzprocess.callback_count == g_process.num_instances) {
+            if (i == 0) {
+                pthread_create(g_aqzprocess.aqz_queue[i].c_th_o, NULL, g_aqzprocess.aqz_queue[i].th_func[1], (void *)&g_aqzprocess.aqz_queue[i]);
+            }
+        } else {
+            if (i % params->callback_count == params->callback_count-1) {
+                pthread_create(g_aqzprocess.aqz_queue[i].c_th_o, NULL, g_aqzprocess.aqz_queue[i].th_func[1], (void *)&g_aqzprocess.aqz_queue[i]);
+            }
+        }
+        
+        if (i % params->submitrq_count == params->submitrq_count-1) {
+            rc = codeThreadBind(g_aqzprocess.aqz_queue[i].c_th_i, i, sess);
+            AQZ_CPU_CORE_BIND_CHECK(rc);
+        }
+        if (g_aqzprocess.callback_count == g_process.num_instances) {
+            if (i == 0) {
+                rc = codeThreadBind(g_aqzprocess.aqz_queue[i].c_th_o, i, sess);
+                AQZ_CPU_CORE_BIND_CHECK(rc);
+            }
+        } else {
+            if (i % params->callback_count == params->callback_count-1) {
+                rc = codeThreadBind(g_aqzprocess.aqz_queue[i].c_th_o, i, sess);
+                AQZ_CPU_CORE_BIND_CHECK(rc);
+            }
+        }
+    }
+
+    g_aqzprocess.num_thread = thread_num;
+    g_aqzprocess.queue_sz = queue_sz;
+    g_aqzprocess.aqz_thread_status = QZ_OK;
+    return QZ_OK;
+done:
+    return QZ_FAIL;
+cleanup:
+    aqz_cleanUpInitMem(thread_num, queue_sz);
+    return QZ_FAIL;
+}
+
+
+static void aqz_cleanUpInstMem(int i)
+{
+    int j;
+
+    if (0 == g_aqzprocess.aqz_inst[i].mem_setup) {
+        return;
+    }
+
+    //intermediate buffers
+    for (j = 0; j < g_process.qz_inst[i].intermediate_cnt; j++) {
+        qzFree(g_process.qz_inst[i].intermediate_buffers[j]->pPrivateMetaData);
+        qzFree(g_process.qz_inst[i].intermediate_buffers[j]->pBuffers->pData);
+        qzFree(g_process.qz_inst[i].intermediate_buffers[j]->pBuffers);
+        qzFree(g_process.qz_inst[i].intermediate_buffers[j]);
+    }
+
+    if (NULL != g_process.qz_inst[i].intermediate_buffers) {
+        free(g_process.qz_inst[i].intermediate_buffers);
+        g_process.qz_inst[i].intermediate_buffers = NULL;
+    }
+
+    //src buffers
+    for (j = 0; j < g_process.qz_inst[i].src_count; j++) {
+        qzFree(g_aqzprocess.aqz_inst[i].src_buffers[j]->pPrivateMetaData);
+        qzFree(g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->pData);
+        qzFree(g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers);
+        qzFree(g_aqzprocess.aqz_inst[i].src_buffers[j]);
+    }
+
+    if (NULL != g_aqzprocess.aqz_inst[i].src_buffers) {
+        free(g_aqzprocess.aqz_inst[i].src_buffers);
+        g_aqzprocess.aqz_inst[i].src_buffers = NULL;
+    }
+
+    //dest buffers
+    for (j = 0; j < g_process.qz_inst[i].dest_count; j++) {
+        qzFree(g_aqzprocess.aqz_inst[i].dest_buffers[j]->pPrivateMetaData);
+        qzFree(g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->pData);
+        qzFree(g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers);
+        qzFree(g_aqzprocess.aqz_inst[i].dest_buffers[j]);
+        qzFree(g_aqzprocess.aqz_inst[i].digest_buffers[j]);
+        qzFree(g_aqzprocess.aqz_inst[i].queue_buffers[j]);
+    }
+
+    if (NULL != g_aqzprocess.aqz_inst[i].dest_buffers) {
+        free(g_aqzprocess.aqz_inst[i].dest_buffers);
+        g_aqzprocess.aqz_inst[i].dest_buffers = NULL;
+    }
+
+    if (NULL != g_aqzprocess.aqz_inst[i].digest_buffers) {
+        free(g_aqzprocess.aqz_inst[i].digest_buffers);
+        g_aqzprocess.aqz_inst[i].digest_buffers = NULL;
+    }
+
+    if (NULL != g_aqzprocess.aqz_inst[i].queue_buffers) {
+        free(g_aqzprocess.aqz_inst[i].queue_buffers);
+        g_aqzprocess.aqz_inst[i].queue_buffers = NULL;
+    }
+
+    //stream buffer
+    if (NULL != g_aqzprocess.aqz_inst[i].stream) {
+        free(g_aqzprocess.aqz_inst[i].stream);
+        g_aqzprocess.aqz_inst[i].stream = NULL;
+    }
+
+    g_aqzprocess.aqz_inst[i].mem_setup = 0;
+    g_aqzprocess.aqz_inst[i].chain_mem_setup = 0;
+}
+
+int aqzInit(AQzSession_T *sess, AQzInitParams_T *params, unsigned char sw_backup)
+{
+    int rc = QZ_FAIL, i;
+
+    if (unlikely(sess == NULL)) {
+        return QZ_PARAMS;
+    }
+
+    rc = qzInit((QzSession_T *)sess, sw_backup);
+
+    if (unlikely(QZ_FAIL == aqz_initParamsCheck(params))) {
+        return QZ_PARAMS;
+    }
+
+    if (unlikely(0 != pthread_mutex_lock(&g_lock))) {
+        BACKOUT(QZ_NOSW_NO_HW);
+    }
+
+    if (QZ_INIT_FAIL(rc)) {
+        return rc;
+    }
+
+    if (QZ_OK != g_aqzprocess.qz_init_status) {
+        g_aqzprocess.aqz_inst = malloc(g_process.num_instances * sizeof(AQzInstance_T));
+        if (unlikely(NULL == g_aqzprocess.aqz_inst)) {
+            QZ_ERROR("malloc failed\n");
+            AQZ_BACKOUT(QZ_NOSW_LOW_MEM);
+        }
+
+        for (i = 0; i < g_process.num_instances; i++) {
+            AQzInstance_T *new_inst = calloc(1, sizeof(AQzInstance_T));
+            if (unlikely(NULL == new_inst)) {
+                QZ_ERROR("malloc failed\n");
+                AQZ_BACKOUT(QZ_NOSW_LOW_MEM);
+            }
+            /*if (QZ_FUNC_CHAINING == sess->func_mode) {
+                new_inst->chain_mem_setup = 0;
+            } else {
+                new_inst->mem_setup = 0;
+                new_inst->cpa_sess_setup = 0;
+            }*/
+            new_inst->mem_setup = 0;
+            new_inst->cpa_sess_setup = 0;
+            new_inst->polling_idx = 0;
+
+            QZ_MEMCPY(&g_aqzprocess.aqz_inst[i], new_inst,
+                      sizeof(AQzInstance_T), sizeof(AQzInstance_T));
+            free(new_inst);
+        }
+    }
+
+    if (QZ_OK != g_aqzprocess.aqz_thread_status) {
+        rc = aqz_initQueue(params, sess);
+        if (QZ_OK != rc) {
+            goto done;
+        }
+    }
+
+
+    rc = atexit(aqz_exitFunc);
+    if (unlikely(QZ_OK != rc)) {
+        QZ_ERROR("Error in register exit hander rc = %d\n", rc);
+        BACKOUT(QZ_FAIL);
+    }
+    rc = g_aqzprocess.qz_init_status = QZ_OK;
+
+done:
+    if (unlikely(0 != pthread_mutex_unlock(&g_lock))) {
+        return QZ_FAIL;
+    }
+
+    return rc;
+}
+
+int aqzSetupSession(AQzSession_T *sess, QzSessionParams_T *qz_params, AQzSessionParams_T *aqz_params)
+{
+    int rc = QZ_FAIL;
+    AQzSess_T *aqz_sess;
+
+    if (unlikely(sess == NULL)) {
+        return QZ_PARAMS;
+    }
+
+    rc = qzSetupSession((QzSession_T *)sess, qz_params);
+
+    if (QZ_OK == rc) {
+        if (sess->aqz_sess_params == NULL) {
+            sess->aqz_sess_params = calloc(1, sizeof(AQzSess_T));
+            if (unlikely(NULL == sess->aqz_sess_params)) {
+                sess->hw_session_stat = QZ_NOSW_LOW_MEM;
+                return QZ_NOSW_LOW_MEM;
+            }
+            aqz_sess = (AQzSess_T *)sess->aqz_sess_params;
+        }
+        aqz_sess = (AQzSess_T *)sess->aqz_sess_params;
+
+        if (NULL == aqz_params) {
+            /*right now this always succeeds*/
+            (void)aqzGetDefaults(&(aqz_sess->sess_params));
+        } else {
+            if (aqz_sessParamsCheck(aqz_params) != SUCCESS) {
+                return QZ_PARAMS;
+            }
+            QZ_MEMCPY(&(aqz_sess->sess_params),
+                    aqz_params,
+                    sizeof(AQzSessionParams_T),
+                    sizeof(AQzSessionParams_T));
+        }
+        /*
+        aqz_sess->crypto_session_setup_data.sessionPriority = 
+                        aqz_sess->sess_params.cy_priority;
+        aqz_sess->crypto_session_setup_data.symOperation = 
+                            aqz_sess->sess_params.cy_sym_operation;
+        aqz_sess->crypto_session_setup_data.hashSetupData.hashAlgorithm = 
+                            aqz_sess->sess_params.cy_hash_algorithm;
+        aqz_sess->crypto_session_setup_data.hashSetupData.hashMode = 
+                            aqz_sess->sess_params.cy_hash_mode;
+        aqz_sess->crypto_session_setup_data.hashSetupData.digestResultLenInBytes = 
+                            GET_HASH_DIGEST_LENGTH(aqz_sess->sess_params.cy_hash_algorithm);
+        aqz_sess->crypto_session_setup_data.digestIsAppended = 
+                            aqz_sess->sess_params.cy_digest_isappended;
+        aqz_sess->crypto_session_setup_data.verifyDigest = 
+                            aqz_sess->sess_params.cy_verify_digest;
+        */
+    }
+    return rc;
+}
+
+int aqzInitMem(AQzSession_T *sess)
+{
+    int i, rc = QZ_OK;
+
+    if (unlikely(sess == NULL)) {
+        return QZ_PARAMS;
+    }
+    //if (QZ_FUNC_BASIC == sess->func_mode || QZ_FUNC_CHAINING == sess->func_mode) {
+    if (QZ_FUNC_BASIC == sess->func_mode) {
+        if (g_process.qz_init_status != QZ_OK) {
+            QZ_ERROR("aqzInitMem Unknown instance status: %d\n", g_process.qz_init_status);
+            return g_process.qz_init_status;
+        }
+        if (NULL == sess->internal ||
+            NULL == sess->aqz_sess_params) {
+            QZ_ERROR("aqzInitMem Unknown session data\n"); 
+            return QZ_FAIL;
+        }
+    /*} else {
+        if (g_aqzprocess.qz_sy_init_status != QZ_OK) {
+            QZ_ERROR("aqzInitMem Unknown instance status: %d\n", g_aqzprocess.qz_sy_init_status);
+            return g_aqzprocess.qz_sy_init_status;
+        }
+            if (NULL == sess->aqz_sess_params) {
+            QZ_ERROR("aqzInitMem Unknown session data\n"); 
+            return QZ_FAIL;
+        }
+    */  
+    }
+
+    if (sess->hw_session_stat != QZ_OK) {
+        QZ_ERROR("aqzInitMem Unknown session status: %d\n", sess->hw_session_stat); 
+        return sess->hw_session_stat;
+    }
+
+    if (unlikely(0 != pthread_mutex_lock(&g_lock))) {
+        rc = QZ_FAIL;
+        goto done;
+    }
+
+    //if (QZ_FUNC_BASIC == sess->func_mode || QZ_FUNC_CHAINING == sess->func_mode) {
+    if (QZ_FUNC_BASIC == sess->func_mode) {
+        for (i = 0; i < g_process.num_instances; i++) {
+            if (likely(0 == g_aqzprocess.aqz_inst[i].mem_setup     ||
+                       0 == g_aqzprocess.aqz_inst[i].cpa_sess_setup)) {
+                QZ_DEBUG("Getting HW resources for inst %d\n", i);
+                rc = aqz_setupHW(sess, i);
+                if (unlikely(QZ_OK != rc)) {
+                    break;
+                }
+            }
+        }
+    }
+    /*} else {
+        for (i = 0; i < g_aqzprocess.num_sy_instances; i++) {
+            if (likely(0 ==  g_aqzprocess.aqz_syinst[i].mem_setup     ||
+                       0 ==  g_aqzprocess.aqz_syinst[i].cpa_sess_setup)) {
+                QZ_DEBUG("Getting Hash HW resources for inst %d\n", i);
+                rc = aqzSetupSyHW(sess, i);
+                if (unlikely(QZ_OK != rc)) {
+                    break;
+                }
+            }
+        }
+    }
+    */
+    if (unlikely(0 != pthread_mutex_unlock(&g_lock))) {
+        rc = QZ_FAIL;
+        goto done;
+    }
+done:
+    return rc;
+}
+
+int aqz_grabInstance()
+{
+    static unsigned int index = -1;
+
+    if (QZ_NONE == g_process.qz_init_status) {
+        return -1;
+    }
+
+    if ((index + 1) == g_process.num_instances) {
+        index = 0;
+    } else {
+        index += 1;
+    }
+    return index;
+}
+
+int aqzCompress(AQzSession_T *sess, const unsigned char *src,
+                unsigned int src_len, unsigned char *dest,
+                unsigned int dest_len, void *user_info,
+                int inst, AQzFunc_t callbackFn)
+{
+    return aqzCompressCrc(sess, src, src_len, dest, dest_len, user_info, NULL, inst, callbackFn);
+}
+
+int aqzCompressCrc(AQzSession_T *sess, const unsigned char *src,
+                   unsigned int src_len, unsigned char *dest,
+                   unsigned int dest_len, void *user_info,
+                   unsigned long *crc, int inst, AQzFunc_t callbackFn)
+{
+    int rc = QZ_OK;
+    int i = -1, j = -1;
+    QzSess_T *qz_sess;
+    AQzQueue_T *queue;
+
+    if (unlikely(NULL == sess     || \
+                 NULL == src      || \
+                 0 >= src_len     || \
+                 NULL == dest     || \
+                 0 >= dest_len)) {
+        QZ_ERROR("Invalid params\n");
+        rc = QZ_PARAMS;
+        return rc;
+    }
+    grabProcessId();
+
+    if (unlikely(g_process.qz_init_status != QZ_OK)) {
+        QZ_ERROR("Unknown instance status: %d\n", g_process.qz_init_status);
+        return g_process.qz_init_status;
+    }
+
+    if (unlikely(sess->hw_session_stat != QZ_OK &&
+        sess->hw_session_stat != QZ_NO_INST_ATTACH)) {
+        QZ_ERROR("Unknown session status: %d\n", sess->hw_session_stat); 
+        return sess->hw_session_stat;
+    }
+
+    if (unlikely(NULL == sess->internal ||
+        NULL == sess->aqz_sess_params)) {
+        QZ_ERROR("Unknown session data\n");
+        rc = QZ_FAIL;
+        return rc;
+    }
+
+    qz_sess = (QzSess_T *)(sess->internal);
+
+    //QzDataFormat_T QzDataFormat_T
+    DataFormatInternal_T data_fmt = qz_sess->sess_params.data_fmt;
+    if (unlikely(data_fmt != DEFLATE_4B &&
+                 data_fmt != DEFLATE_RAW &&
+                 data_fmt != DEFLATE_GZIP &&
+                 data_fmt != DEFLATE_GZIP_EXT &&
+                 data_fmt != LZ4_FH  &&
+                 data_fmt != LZ4S_BK)) {
+        QZ_ERROR("Unknown data formt: %d\n", data_fmt);
+        rc = QZ_PARAMS;
+        return rc;
+    }
+
+    if (unlikely(qz_sess->sess_params.hw_buff_sz < src_len)) {
+        QZ_ERROR("aqzCompressCrc Input data size %ld exceeds threshold %ld\n", src_len, qz_sess->sess_params.hw_buff_sz);
+        rc = QZ_PARAMS;
+        return rc;
+    }
+
+    if (inst >= 0) {
+        i = aqzGetInstance(inst);
+    } else {
+        i = aqzGetInstance(g_instance_index.index);
+    }
+    if (unlikely(i == -1)) {
+        rc = QZ_NO_INST_ATTACH;
+        return rc;
+    }
+
+    g_aqzprocess.aqz_thread_activity = CPA_TRUE;
+
+    if (likely(0 == g_aqzprocess.aqz_inst[i].mem_setup     ||
+               0 == g_aqzprocess.aqz_inst[i].cpa_sess_setup)) {
+        rc = QZ_FAIL;
+        goto done;
+    }
+
+    queue = &g_aqzprocess.aqz_queue[i].queue_i;
+
+    j = aqz_getQUnusedBuffer(i, j);
+    if (unlikely(-1 == j)) {
+        QZ_DEBUG("aqzCompressCrc instance %ld Queue remaining space is insufficient\n", i);
+        rc = AQZ_NO_SPACE;
+        goto done;
+    }
+    QZ_DEBUG("aqz_getQUnusedBuffer returned %d\n", j);
+
+    g_aqzprocess.aqz_inst[i].stream[j].src1++;
+    g_aqzprocess.aqz_inst[i].stream[j].src2++;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.func_mode = QZ_FUNC_BASIC;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.qz_in_len = 0;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.qz_out_len = 0;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.data_fmt = data_fmt;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.dir = QZ_DIR_COMPRESS;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.src = (unsigned char *)src;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.src_sz = src_len;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.next_dest = (unsigned char *)dest;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.dest_sz = dest_len;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.crc32 = crc;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.mem_hint = j;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.inst_hint = i;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.user_info = user_info;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.callbackFn = callbackFn;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.sw_mode = g_aqzprocess.sw_mode;
+
+    rc = aqz_queuePush(queue, g_aqzprocess.aqz_inst[i].queue_buffers[j]);
+    if (QZ_OK != rc) {
+        g_aqzprocess.aqz_inst[i].stream[j].src1--;
+        g_aqzprocess.aqz_inst[i].stream[j].src2--;
+    }
+done:
+    qzReleaseInstance(i);
+    return rc;
+}
+
+static int aqz_getInstMem(int i, AQzSession_T *sess)
+{
+    int j;
+    CpaStatus status;
+    int rc = QZ_OK;
+    QzSess_T *qz_sess;
+    //AQzSess_T* aqz_sess;
+    unsigned char sw_backup;
+    unsigned int src_sz;
+    unsigned int dest_sz;
+    unsigned int inter_sz;
+    unsigned int numa_node;
+
+    qz_sess = (QzSess_T *)sess->internal;
+    //aqz_sess = (AQzSess_T *)sess->aqz_sess_params;
+    sw_backup = qz_sess->sess_params.sw_backup;
+    src_sz = qz_sess->sess_params.hw_buff_sz;
+    inter_sz = INTER_SZ(src_sz);
+    dest_sz = DEST_SZ(src_sz);
+    numa_node = g_process.qz_inst[i].instance_info.nodeAffinity < 0 ?
+                    NODE_0 : g_process.qz_inst[i].instance_info.nodeAffinity;
+
+    QZ_DEBUG("getInstMem: Setting up memory for inst %d\n", i);
+    status = cpaDcBufferListGetMetaSize(g_process.dc_inst_handle[i], 1,
+                                        &(g_process.qz_inst[i].buff_meta_size));
+    QZ_INST_MEM_STATUS_CHECK(status, i);
+    
+    status = cpaDcGetNumIntermediateBuffers(g_process.dc_inst_handle[i],
+                                            &(g_process.qz_inst[i].intermediate_cnt));
+    QZ_INST_MEM_STATUS_CHECK(status, i);
+
+    g_process.qz_inst[i].intermediate_buffers =
+        malloc((size_t)(g_process.qz_inst[i].intermediate_cnt * sizeof(
+                            CpaBufferList *)));
+    AQZ_INST_MEM_CHECK(g_process.qz_inst[i].intermediate_buffers, i);
+
+    for (j = 0; j < g_process.qz_inst[i].intermediate_cnt; j++) {
+        g_process.qz_inst[i].intermediate_buffers[j] = (CpaBufferList *)
+                qzMalloc(sizeof(CpaBufferList), numa_node, PINNED_MEM);
+        AQZ_INST_MEM_CHECK(g_process.qz_inst[i].intermediate_buffers[j], i);
+
+        if (0 != g_process.qz_inst[i].buff_meta_size) {
+            g_process.qz_inst[i].intermediate_buffers[j]->pPrivateMetaData =
+                qzMalloc((size_t)(g_process.qz_inst[i].buff_meta_size), numa_node, PINNED_MEM);
+            AQZ_INST_MEM_CHECK(g_process.qz_inst[i].intermediate_buffers[j]->pPrivateMetaData, i);
+        }
+
+        g_process.qz_inst[i].intermediate_buffers[j]->pBuffers = (CpaFlatBuffer *)
+                qzMalloc(sizeof(CpaFlatBuffer), numa_node, PINNED_MEM);
+        AQZ_INST_MEM_CHECK(g_process.qz_inst[i].intermediate_buffers[j]->pBuffers, i);
+
+        g_process.qz_inst[i].intermediate_buffers[j]->pBuffers->pData = (Cpa8U *)
+                qzMalloc(inter_sz, numa_node, PINNED_MEM);
+        AQZ_INST_MEM_CHECK(g_process.qz_inst[i].intermediate_buffers[j]->pBuffers->pData,
+                          i);
+
+        g_process.qz_inst[i].intermediate_buffers[j]->numBuffers = (Cpa32U)1;
+        g_process.qz_inst[i].intermediate_buffers[j]->pBuffers->dataLenInBytes =
+            inter_sz;
+    }
+
+    g_aqzprocess.aqz_inst[i].src_count = g_aqzprocess.queue_sz;
+    g_aqzprocess.aqz_inst[i].dest_count = g_aqzprocess.queue_sz;
+
+    g_aqzprocess.aqz_inst[i].stream = calloc(g_aqzprocess.aqz_inst[i].src_count,
+                                         sizeof(AQzQStream_T));
+    AQZ_INST_MEM_CHECK(g_aqzprocess.aqz_inst[i].stream, i);
+
+    g_aqzprocess.aqz_inst[i].src_buffers = malloc((size_t)(
+                                           g_aqzprocess.aqz_inst[i].src_count *
+                                           sizeof(CpaBufferList *)));
+    AQZ_INST_MEM_CHECK(g_aqzprocess.aqz_inst[i].src_buffers, i);
+
+    g_aqzprocess.aqz_inst[i].dest_buffers = malloc(g_aqzprocess.aqz_inst[i].dest_count *
+                                                   sizeof(CpaBufferList *));
+    AQZ_INST_MEM_CHECK(g_aqzprocess.aqz_inst[i].dest_buffers, i);
+
+    /*g_aqzprocess.aqz_inst[i].digest_buffers = malloc(g_aqzprocess.aqz_inst[i].dest_count *
+                                                     sizeof(Cpa8U *));
+    AQZ_INST_MEM_CHECK(g_aqzprocess.aqz_inst[i].digest_buffers, i);*/
+
+    g_aqzprocess.aqz_inst[i].queue_buffers = malloc(g_aqzprocess.aqz_inst[i].dest_count *
+                                                    sizeof(AQzQueueBufferList_T *));
+    AQZ_INST_MEM_CHECK(g_aqzprocess.aqz_inst[i].queue_buffers, i);
+
+    for (j = 0; j < g_aqzprocess.aqz_inst[i].src_count; j++) {
+        g_aqzprocess.aqz_inst[i].stream[j].src1  = 0;
+        g_aqzprocess.aqz_inst[i].stream[j].src2  = 0;
+        g_aqzprocess.aqz_inst[i].stream[j].sink1 = 0;
+        g_aqzprocess.aqz_inst[i].stream[j].sink2 = 0;
+
+        g_aqzprocess.aqz_inst[i].src_buffers[j] = (CpaBufferList *)
+                                                   qzMalloc(sizeof(CpaBufferList), numa_node, PINNED_MEM);
+        AQZ_INST_MEM_CHECK(g_aqzprocess.aqz_inst[i].src_buffers[j], i);
+
+        if (0 != g_process.qz_inst[i].buff_meta_size) {
+            g_aqzprocess.aqz_inst[i].src_buffers[j]->pPrivateMetaData =
+                qzMalloc(g_process.qz_inst[i].buff_meta_size, numa_node, PINNED_MEM);
+            AQZ_INST_MEM_CHECK(g_aqzprocess.aqz_inst[i].src_buffers[j]->pPrivateMetaData, i);
+        }
+
+        g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers = (CpaFlatBuffer *)
+                                                            qzMalloc(sizeof(CpaFlatBuffer), numa_node, PINNED_MEM);
+        AQZ_INST_MEM_CHECK(g_aqzprocess.aqz_inst[i].src_buffers, i);
+
+        g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->pData = (Cpa8U *)
+                                                                   qzMalloc(src_sz, numa_node, PINNED_MEM);
+        AQZ_INST_MEM_CHECK(g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->pData, i);
+
+        g_aqzprocess.aqz_inst[i].src_buffers[j]->numBuffers = (Cpa32U)1;
+        g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->dataLenInBytes = src_sz;
+
+        g_aqzprocess.aqz_inst[i].queue_buffers[j] = (AQzQueueBufferList_T *)
+                                                      qzMalloc(sizeof(AQzQueueBufferList_T), numa_node, PINNED_MEM);
+        AQZ_INST_MEM_CHECK(g_aqzprocess.aqz_inst[i].queue_buffers[j], i);
+    }
+
+    //g_aqzprocess.digest_size = GET_HASH_DIGEST_LENGTH(aqz_sess->sess_params.cy_hash_algorithm);
+    g_aqzprocess.digest_size = 0;
+    for (j = 0; j < g_aqzprocess.aqz_inst[i].dest_count; j++) {
+        g_aqzprocess.aqz_inst[i].dest_buffers[j] = (CpaBufferList *)
+                                                    qzMalloc(sizeof(CpaBufferList), numa_node, PINNED_MEM);
+        AQZ_INST_MEM_CHECK(g_aqzprocess.aqz_inst[i].dest_buffers[j], i);
+
+        if (0 != g_process.qz_inst[i].buff_meta_size) {
+            g_aqzprocess.aqz_inst[i].dest_buffers[j]->pPrivateMetaData =
+                                                    qzMalloc(g_process.qz_inst[i].buff_meta_size, numa_node, PINNED_MEM);
+            AQZ_INST_MEM_CHECK(g_aqzprocess.aqz_inst[i].dest_buffers[j]->pPrivateMetaData, i);
+        }
+
+        g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers = (CpaFlatBuffer *)
+                                                              qzMalloc(sizeof(CpaFlatBuffer), numa_node, PINNED_MEM);
+        AQZ_INST_MEM_CHECK(g_aqzprocess.aqz_inst[i].dest_buffers, i);
+
+        g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->pData = (Cpa8U *)
+                                                                     qzMalloc(dest_sz, numa_node, PINNED_MEM);
+        AQZ_INST_MEM_CHECK(g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->pData, i);
+
+        g_aqzprocess.aqz_inst[i].dest_buffers[j]->numBuffers = (Cpa32U)1;
+        g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->dataLenInBytes = dest_sz;
+
+        /* g_aqzprocess.aqz_inst[i].digest_buffers[j] = (Cpa8U *)
+        //                                              qzMalloc(g_aqzprocess.digest_size, numa_node, PINNED_MEM);
+        //AQZ_INST_MEM_CHECK(g_aqzprocess.aqz_inst[i].digest_buffers[j], i); */
+    }
+
+    status = cpaDcSetAddressTranslation(g_process.dc_inst_handle[i],
+                                        qaeVirtToPhysNUMA);
+    QZ_INST_MEM_STATUS_CHECK(status, i);
+
+    g_process.qz_inst[i].inst_start_status =
+        cpaDcStartInstance(g_process.dc_inst_handle[i],
+                           g_process.qz_inst[i].intermediate_cnt,
+                           g_process.qz_inst[i].intermediate_buffers);
+    QZ_INST_MEM_STATUS_CHECK(g_process.qz_inst[i].inst_start_status, i);
+
+    g_aqzprocess.aqz_inst[i].mem_setup = 1;
+    g_aqzprocess.aqz_inst[i].chain_mem_setup = 1;
+
+done_inst:
+    return rc;
+}
+
+int aqz_getCpaSessionSize(AQzSession_T *sess, int i)
+{
+    int rc = CPA_STATUS_SUCCESS;
+    QzSess_T *qz_sess = (QzSess_T *)sess->internal;
+    //AQzSess_T *aqz_sess = (AQzSess_T *)sess->aqz_sess_params;
+    /*
+    if (sess->func_mode == QZ_FUNC_CHAINING) {
+
+        // Initialize chaining session data - hash + compression
+        // chain operation 
+        aqz_sess->chain_sess_data[0].sessType = CPA_DC_CHAIN_SYMMETRIC_CRYPTO;
+        aqz_sess->chain_sess_data[0].pCySetupData = &aqz_sess->crypto_session_setup_data;
+        aqz_sess->chain_sess_data[1].sessType = CPA_DC_CHAIN_COMPRESS_DECOMPRESS;
+        aqz_sess->chain_sess_data[1].pDcSetupData = &qz_sess->session_setup_data;
+
+        QZ_DEBUG("cpaDcChainGetSessionSize\n");
+        rc = cpaDcChainGetSessionSize(g_process.dc_inst_handle[i],
+                                      CPA_DC_CHAIN_HASH_THEN_COMPRESS,
+                                      CHAIN_MAX_SESSION,
+                                      aqz_sess->chain_sess_data,
+                                      &qz_sess->session_size);
+    } else {
+        QZ_DEBUG("cpaDcGetSessionSize\n");
+        rc = cpaDcGetSessionSize(g_process.dc_inst_handle[i],
+                                 &qz_sess->session_setup_data,
+                                 &qz_sess->session_size,
+                                 &qz_sess->ctx_size);
+    }
+    */
+    QZ_DEBUG("cpaDcGetSessionSize\n");
+    rc = cpaDcGetSessionSize(g_process.dc_inst_handle[i],
+                             &qz_sess->session_setup_data,
+                             &qz_sess->session_size,
+                             &qz_sess->ctx_size);
+    return rc;
+}
+
+int aqz_initCpaSession(AQzSession_T *sess, int i)
+{
+   int rc;
+   QzSess_T *qz_sess = (QzSess_T *)sess->internal;
+   //AQzSess_T *aqz_sess = (AQzSess_T *)sess->aqz_sess_params;
+    /*
+   if (sess->func_mode == QZ_FUNC_CHAINING) {
+        QZ_DEBUG("cpaDcChainInitSession %d\n", i);
+        rc = cpaDcChainInitSession(g_process.dc_inst_handle[i],
+                        g_process.qz_inst[i].cpaSess,
+                        CPA_DC_CHAIN_HASH_THEN_COMPRESS,
+                        CHAIN_MAX_SESSION,
+                        aqz_sess->chain_sess_data,
+                        dcChainCallback);
+   } else {
+        QZ_DEBUG("cpaDcInitSession %d\n", i);
+        rc = cpaDcInitSession(g_process.dc_inst_handle[i],
+                              g_process.qz_inst[i].cpaSess,
+                              &qz_sess->session_setup_data,
+                              NULL,
+                              doDcDpCallback);
+   }
+   */
+    QZ_DEBUG("cpaDcInitSession %d\n", i);
+    rc = cpaDcInitSession(g_process.dc_inst_handle[i],
+                          g_process.qz_inst[i].cpaSess,
+                          &qz_sess->session_setup_data,
+                          NULL,
+                          doDcDpCallback);
+   return rc;
+}
+
+int aqz_setupHW(AQzSession_T *sess, int i)
+{
+    QzSess_T *qz_sess;
+    int rc = QZ_OK;
+    unsigned int numa_node;
+
+    if (g_process.qz_init_status != QZ_OK) {
+        /*hw not present*/
+        return g_process.qz_init_status;
+    }
+
+    qz_sess = (QzSess_T *)sess->internal;
+    qz_sess->inst_hint = i;
+    qz_sess->seq = 0;
+    qz_sess->seq_in = 0;
+    numa_node = g_process.qz_inst[i].instance_info.nodeAffinity < 0 ?
+                    NODE_0 : g_process.qz_inst[i].instance_info.nodeAffinity;
+
+    if (0 == g_aqzprocess.aqz_inst[i].mem_setup) {
+        rc = aqz_getInstMem(i, sess);
+        if (QZ_OK != rc) {
+            goto done_sess;
+        }
+    }
+
+    if (0 ==  g_aqzprocess.aqz_inst[i].cpa_sess_setup) {
+        QZ_DEBUG("async setup and start DC session %d\n", i);
+
+        if (CPA_FALSE == g_process.qz_inst[i].instance_cap.dynamicHuffman) {
+            qz_sess->session_setup_data.huffType = CPA_DC_HT_STATIC;
+        }
+
+        if (CPA_FALSE == g_process.qz_inst[i].instance_cap.autoSelectBestHuffmanTree) {
+            qz_sess->session_setup_data.autoSelectBestHuffmanTree = CPA_DC_ASB_DISABLED;
+        }
+
+        qz_sess->sess_status = aqz_getCpaSessionSize(sess, i);
+        if (CPA_STATUS_SUCCESS == qz_sess->sess_status) {
+            g_process.qz_inst[i].cpaSess = qzMalloc((size_t)(qz_sess->session_size),
+                                                    numa_node, PINNED_MEM);
+            if (NULL ==  g_process.qz_inst[i].cpaSess) {
+                rc = qz_sess->sess_params.sw_backup ? QZ_LOW_MEM : QZ_NOSW_LOW_MEM;
+                goto done_sess;
+            }
+        } else {
+            rc = QZ_FAIL;
+            goto done_sess;
+        }
+
+        qz_sess->sess_status = aqz_initCpaSession(sess, i);
+        if (qz_sess->sess_status != CPA_STATUS_SUCCESS) {
+            rc = QZ_FAIL;
+        }
+    }
+
+    if (rc == QZ_OK) {
+        g_process.qz_inst[i].cpa_sess_setup = 1;
+        g_aqzprocess.aqz_inst[i].cpa_sess_setup = 1;
+    }
+
+done_sess:
+    return rc;
+}
+
+int aqz_doCompressIn(AQzQueue_T *queue)
+{
+    int i, j;
+    unsigned int src_send_sz;
+    unsigned char *src_ptr, *dest_ptr;
+    CpaStatus rc;
+    int src_pinned, dest_pinned;
+    AQzQueueHeader_T *aqz_header;
+    CpaDcOpData opData = (const CpaDcOpData) {0};
+    DataFormatInternal_T data_fmt;
+
+    aqz_header = &queue->queue_buffers[queue->tail]->header;
+    opData.inputSkipData.skipMode = CPA_DC_SKIP_DISABLED;
+    opData.outputSkipData.skipMode = CPA_DC_SKIP_DISABLED;
+    opData.compressAndVerify = CPA_TRUE;
+    data_fmt = aqz_header->data_fmt;
+
+    i = aqz_header->inst_hint;
+    if (unlikely(i == -1)) {
+        return QZ_FAIL;
+    }
+
+    QZ_DEBUG("aqz_doCompressIn: inst is %d\n", i);
+
+    if (CPA_TRUE == aqz_header->sw_mode) {
+        goto err_exit;
+    }
+
+    src_ptr = aqz_header->src;
+    dest_ptr = aqz_header->next_dest;
+    src_pinned = qzMemFindAddr(src_ptr);
+    dest_pinned = qzMemFindAddr(dest_ptr);
+    src_send_sz = aqz_header->src_sz;
+
+    opData.flushFlag = IS_DEFLATE(data_fmt) ? CPA_DC_FLUSH_FULL :
+                       CPA_DC_FLUSH_FINAL;
+
+    QZ_DEBUG("aqz_doCompressIn: Need to g_process %ld bytes\n", src_send_sz);
+
+    j = aqz_header->mem_hint;
+    QZ_DEBUG("getUnusedBuffer returned %d\n", j);
+    
+    g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->dataLenInBytes = src_send_sz;
+    g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->dataLenInBytes
+        = aqz_header->dest_sz;
+
+    if (unlikely(0 == src_pinned)) {
+        QZ_DEBUG("memory copy in aqz_doCompressIn\n");
+        QZ_MEMCPY(g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->pData,
+                  src_ptr,
+                  src_send_sz,
+                  src_send_sz);
+        g_aqzprocess.aqz_inst[i].stream[j].src_pinned = 0;
+    } else {
+        QZ_DEBUG("changing src_ptr to 0x%lx\n", (unsigned long)src_ptr);
+        g_aqzprocess.aqz_inst[i].stream[j].src_pinned = 1;
+        g_aqzprocess.aqz_inst[i].stream[j].orig_src =
+            g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->pData;
+        g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->pData = src_ptr;
+    }
+
+    if (unlikely(dest_pinned == 1)) {
+        g_aqzprocess.aqz_inst[i].stream[j].orig_dest =
+            g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->pData;
+        g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->pData =
+            dest_ptr + outputHeaderSz(data_fmt);
+        g_aqzprocess.aqz_inst[i].stream[j].dest_pinned = 1;
+    }
+
+    g_aqzprocess.aqz_inst[i].stream[j].res.checksum = 0;
+
+    do {
+        QZ_DEBUG("Comp Sending %u bytes , i = %ld j = %d\n", src_send_sz, i, j);
+        rc = cpaDcCompressData2(g_process.dc_inst_handle[i],
+                                g_process.qz_inst[i].cpaSess,
+                                g_aqzprocess.aqz_inst[i].src_buffers[j],
+                                g_aqzprocess.aqz_inst[i].dest_buffers[j],
+                                &opData,
+                                &g_aqzprocess.aqz_inst[i].stream[j].res,
+                                (void *)(aqz_header));
+        
+        if (unlikely(CPA_STATUS_RETRY == rc)) {
+            // usleep(g_polling_interval[g_aqzprocess.aqz_inst[i].polling_idx]);
+            g_process.qz_inst[i].num_retries++;
+            usleep(0);
+        }
+
+        if (unlikely(g_process.qz_inst[i].num_retries > MAX_NUM_RETRY)) {
+            QZ_ERROR("instance %d retry count:%d exceed the max count: %d\n",
+                        i, g_process.qz_inst[i].num_retries, MAX_NUM_RETRY);
+            goto err_exit;
+        }
+    } while (rc == CPA_STATUS_RETRY || CPA_STATUS_RESTARTING == rc);
+
+    if (unlikely(CPA_STATUS_SUCCESS != rc)) {
+        QZ_ERROR("Error in cpaDcDpEnqueueOp: %d\n", rc);
+        goto err_exit;
+    }
+
+    QZ_DEBUG("src_send_sz = %u\n", src_send_sz);
+    g_process.qz_inst[i].num_retries = 0;
+    aqz_queuePop(queue);
+    return QZ_OK;
+
+err_exit:
+    g_process.qz_inst[i].num_retries = 0;
+    doDcDpCallback((void *)aqz_header, CPA_STATUS_FAIL);
+    aqz_queuePop(queue);
+    return QZ_FAIL;
+}
+
+int aqzSetDefaults(AQzSessionParams_T *defaults)
+{
+    int ret = QZ_PARAMS;
+
+    if (aqz_sessParamsCheck(defaults) == SUCCESS) {
+        QZ_MEMCPY(&g_aqzsess_params_default,
+                  defaults,
+                  sizeof(AQzSessionParams_T),
+                  sizeof(AQzSessionParams_T));
+        ret = QZ_OK;
+    }
+
+    return ret;
+}
+
+int aqzGetDefaults(AQzSessionParams_T *defaults)
+{
+    if (defaults == NULL) {
+        return QZ_PARAMS;
+    }
+
+    QZ_MEMCPY(defaults,
+              &g_aqzsess_params_default,
+              sizeof(AQzSessionParams_T),
+              sizeof(AQzSessionParams_T));
+    return QZ_OK;
+}
+
+int aqz_sessParamsCheck(AQzSessionParams_T *params)
+{
+    if (unlikely(!params)) {
+        return FAILURE;
+    }
+
+    if (unlikely(params->cy_priority < AQZ_CY_PRIORITY_DEFAULT                ||
+        params->cy_priority > AQZ_CY_PRIORITY_HIGH                            ||
+        params->cy_sym_operation < 1                                          ||
+        params->cy_sym_operation > AQZ_CY_SYM_OP_ALGORITHM_CHAINING           ||
+        params->cy_hash_algorithm < 0                                         ||
+        params->cy_hash_algorithm > AQZ_CY_SYM_HASH_SHA3_256                  ||
+        params->cy_hash_mode < 1                                              ||
+        params->cy_hash_mode > AQZ_CY_SYM_HASH_MODE_NESTED                    ||
+        params->cy_digest_result_lenInBytes < 0)) {
+            return FAILURE;
+    }
+
+    return SUCCESS;
+}
+
+int aqzTeardownSession(AQzSession_T *sess)
+{
+    if (unlikely(sess == NULL)) {
+        return QZ_PARAMS;
+    }
+    //if (QZ_FUNC_BASIC == sess->func_mode || QZ_FUNC_CHAINING == sess->func_mode) {
+    if (QZ_FUNC_BASIC == sess->func_mode) {
+        qzTeardownSession((QzSession_T *)sess);
+    }
+
+    if (likely(NULL != sess->aqz_sess_params)) {
+        free(sess->aqz_sess_params);
+        sess->aqz_sess_params = NULL;
+    }
+
+    return QZ_OK;
+}
+
+int aqzClose(AQzSession_T *sess)
+{
+    int i;
+
+    if (unlikely(sess == NULL)) {
+        return QZ_PARAMS;
+    }
+
+    if (g_aqzprocess.aqz_queue != NULL) {
+        for (i = 0; i < g_aqzprocess.num_thread; i++) {
+            g_aqzprocess.aqz_queue[i].stop_th = 1;
+            if (i % g_aqzprocess.submitrq_count == g_aqzprocess.submitrq_count - 1) {
+                pthread_join(*g_aqzprocess.aqz_queue[i].c_th_i, NULL);
+            }
+            if (i == 0) {
+                pthread_join(*g_aqzprocess.aqz_queue[i].c_th_o, NULL);
+            }
+
+        }
+    }
+/*
+    if (QZ_FUNC_CHAINING == sess->func_mode) {
+        if (unlikely(0 != pthread_mutex_lock(&g_lock))) {
+            return QZ_FAIL;
+        }
+
+        for (i = 0; i <  g_process.num_instances; i++) {
+            removeChainSession(i);
+            cleanUpInstMem(i);
+        }
+
+        stopQat();
+        if (unlikely(0 != pthread_mutex_unlock(&g_lock))) {
+            return QZ_FAIL;
+        }
+
+        streamBufferCleanup();
+    }
+*/
+    if (unlikely(0 != pthread_mutex_lock(&g_lock))) {
+        return QZ_FAIL;
+    }
+
+    //if (QZ_FUNC_BASIC == sess->func_mode || QZ_FUNC_CHAINING == sess->func_mode) {
+    if (QZ_FUNC_BASIC == sess->func_mode) {
+        for (i = 0; i < g_process.num_instances; i++) {
+            aqz_cleanUpInstMem(i);
+        }
+    /*} else if (QZ_FUNC_HASH == sess->func_mode) {
+        for (i = 0; i <g_aqzprocess.num_sy_instances; i++) {
+            aqz_cleanUpCyInstMem(i);
+        }*/
+    }
+
+    if (unlikely(0 != pthread_mutex_unlock(&g_lock))) {
+        return QZ_FAIL;
+    }
+
+    if (QZ_FUNC_BASIC == sess->func_mode) {
+        qzClose((QzSession_T *)sess);
+    }
+
+    return QZ_OK;
+}
+
+int aqz_doCompressOut(AQzQueueBufferList_T *buffer_data)
+{
+    int rc = QZ_FAIL;
+    unsigned char *next_dest;
+    CpaDcRqResults *resl;
+    AQzQueueHeader_T *aqz_header;
+    aqz_header = &buffer_data->header;
+    long dest_avail_len = (long)(aqz_header->dest_sz);
+    int dest_pinned = qzMemFindAddr(aqz_header->next_dest);
+    int i = aqz_header->inst_hint, j = aqz_header->mem_hint;
+    QzDataFormat_T data_fmt = aqz_header->data_fmt;
+
+    resl = &g_aqzprocess.aqz_inst[i].stream[j].res;
+
+    if (unlikely(CPA_STATUS_SUCCESS != g_aqzprocess.aqz_inst[i].stream[j].job_status)) {
+        if (g_process.sw_backup) {
+            QZ_DEBUG("Error(%d) in callback: %ld, %ld, ReqStatus: %d switch to software(isa-l compress)\n",
+                        g_aqzprocess.aqz_inst[i].stream[j].job_status, i, j,
+                        g_aqzprocess.aqz_inst[i].stream[j].res.status);
+            rc = aqzISALCompress(buffer_data, resl);
+        }
+        goto done;
+    } else {
+        aqz_header->qz_out_len = 0;
+        dest_avail_len -= (outputHeaderSz(data_fmt) + resl->produced + outputFooterSz(data_fmt));
+        if (unlikely(dest_avail_len < 0)) {
+            QZ_ERROR("aqz_doCompressOut: inadequate output buffer length: %ld\n", (long)(aqz_header->dest_sz));
+            rc = QZ_BUF_ERROR;
+            return rc;
+        }
+
+        next_dest = aqz_header->next_dest;
+        outputHeaderGen(next_dest, resl, data_fmt);
+        next_dest += outputHeaderSz(data_fmt);
+        aqz_header->qz_out_len += outputHeaderSz(data_fmt);
+
+        if (likely(1 == dest_pinned)) {
+            g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->pData =
+                g_aqzprocess.aqz_inst[i].stream[j].orig_dest;
+            g_aqzprocess.aqz_inst[i].stream[j].dest_pinned = 0;
+        } else {
+            QZ_MEMCPY(next_dest,
+                     g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->pData,
+                     resl->produced,
+                     resl->produced);
+        }
+
+        next_dest += resl->produced;
+        aqz_header->qz_in_len += resl->consumed;
+
+        if (likely(NULL != aqz_header->crc32)) {
+            if (0 == *(aqz_header->crc32)) {
+                *(aqz_header->crc32) = resl->checksum;
+                QZ_DEBUG("crc32 1st blk is 0x%lX \n", *(aqz_header->crc32));
+            } else {
+                QZ_DEBUG("crc32 input 0x%lX, ", *(aqz_header->crc32));
+                *(aqz_header->crc32) =
+                    crc32_combine(*(aqz_header->crc32), resl->checksum, resl->consumed);
+                QZ_DEBUG("Result 0x%lX, checksum 0x%X, consumed %u, produced %u\n",
+                            *(aqz_header->crc32), resl->checksum, resl->consumed, resl->produced);
+            }
+        }
+
+        aqz_header->qz_out_len += resl->produced;
+        aqzOutputFooterGen(next_dest, resl, data_fmt, QZ_FUNC_BASIC);
+        next_dest += outputFooterSz(data_fmt);
+        aqz_header->qz_out_len += outputFooterSz(data_fmt);
+
+        if (1 == g_aqzprocess.aqz_inst[i].stream[j].src_pinned) {
+            g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->pData =
+                g_aqzprocess.aqz_inst[i].stream[j].orig_src;
+            g_aqzprocess.aqz_inst[i].stream[j].src_pinned = 0;
+        }
+    }
+
+    rc = QZ_OK;
+    return rc;
+
+done:
+    if (dest_pinned) {
+        g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->pData =
+            g_aqzprocess.aqz_inst[i].stream[j].orig_dest;
+        g_aqzprocess.aqz_inst[i].stream[j].dest_pinned = 0;
+    }
+
+    if (1 == g_aqzprocess.aqz_inst[i].stream[j].src_pinned) {
+        g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->pData =
+            g_aqzprocess.aqz_inst[i].stream[j].orig_src;
+        g_aqzprocess.aqz_inst[i].stream[j].src_pinned = 0;
+    }
+    return rc;
+}
+
+int aqz_doDecompressOut(AQzQueueBufferList_T *buffer_data)
+{
+    CpaDcRqResults *resl;
+    AQzQueueHeader_T *aqz_header;
+    unsigned char *next_dest;
+    unsigned int src_send_sz;
+    int i, j, rc = QZ_FAIL;
+    QzDataFormat_T data_fmt;
+
+    aqz_header = &buffer_data->header;
+    i = aqz_header->inst_hint;
+    j = aqz_header->mem_hint;
+    data_fmt = aqz_header->data_fmt;
+
+    QZ_DEBUG("aqz_doDecompressOut: Processing seqnumber %2.2d %2.2d \n", i, j);
+
+    if (unlikely(CPA_STATUS_SUCCESS != g_aqzprocess.aqz_inst[i].stream[j].job_status)) {
+        if (g_process.sw_backup) {
+            QZ_DEBUG("Error(%d) in decompress callback: %ld, %ld, ReqStatus: %d switch to software(isa-l decompress)\n",
+                    g_aqzprocess.aqz_inst[i].stream[j].job_status, i, j,
+                    g_aqzprocess.aqz_inst[i].stream[j].res.status);
+            rc = aqzISALDecompress(buffer_data);
+        }
+        goto done;
+    }
+
+    resl = &g_aqzprocess.aqz_inst[i].stream[j].res;
+    QZ_DEBUG("\tconsumed = %d, produced = %d, src_send_sz = %ld\n",
+            resl->consumed, resl->produced,
+            g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->dataLenInBytes);
+
+    next_dest = aqz_header->next_dest;
+    if (unlikely(0 == g_aqzprocess.aqz_inst[i].stream[j].dest_pinned)) {
+        QZ_DEBUG("memory copy in doDecompressOut\n");
+        QZ_MEMCPY(next_dest,
+                  g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->pData,
+                  resl->produced,
+                  resl->produced);
+    } else {
+        g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->pData =
+            g_aqzprocess.aqz_inst[i].stream[j].orig_dest;
+        g_aqzprocess.aqz_inst[i].stream[j].dest_pinned = 0;
+    }
+
+    if (likely(1 == g_aqzprocess.aqz_inst[i].stream[j].src_pinned)) {
+        g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->pData =
+            g_aqzprocess.aqz_inst[i].stream[j].orig_src;
+        g_aqzprocess.aqz_inst[i].stream[j].src_pinned = 0;
+    }
+
+    if (unlikely(resl->checksum !=
+                 g_aqzprocess.aqz_inst[i].stream[j].gzip_footer_checksum ||
+                 resl->produced != g_aqzprocess.aqz_inst[i].stream[j].gzip_footer_orgdatalen)) {
+        QZ_ERROR("Error in check footer, inst %ld, stream %ld\n", i, j);
+        QZ_ERROR("resp checksum: %x data checksum %x\n",
+                    resl->checksum,
+                    g_aqzprocess.aqz_inst[i].stream[j].gzip_footer_checksum);
+        QZ_ERROR("resp produced :%d data produced: %d\n",
+                    resl->produced,
+                    g_aqzprocess.aqz_inst[i].stream[j].gzip_footer_orgdatalen);
+        rc = QZ_DATA_ERROR;
+        goto err_check_footer;
+    }
+
+    src_send_sz = g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->dataLenInBytes;
+    next_dest += resl->produced;
+    aqz_header->qz_in_len += (outputHeaderSz(data_fmt) + src_send_sz +
+                              stdGzipFooterSz());
+    aqz_header->qz_out_len += resl->produced;
+
+    QZ_DEBUG("data->next_dest = %p\n", aqz_header->next_dest);
+
+    aqz_swapDataBuffer(i, j); /*swap pdata back after decompress*/
+
+    rc = QZ_OK;
+    return rc;
+
+done:
+    if (1 == g_aqzprocess.aqz_inst[i].stream[j].src_pinned) {
+        g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->pData =
+            g_aqzprocess.aqz_inst[i].stream[j].orig_src;
+        g_aqzprocess.aqz_inst[i].stream[j].src_pinned = 0;
+    }
+
+    if (1 == g_aqzprocess.aqz_inst[i].stream[j].dest_pinned) {
+        g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->pData =
+            g_aqzprocess.aqz_inst[i].stream[j].orig_dest;
+        g_aqzprocess.aqz_inst[i].stream[j].dest_pinned = 0;
+    }
+
+err_check_footer:
+    aqz_swapDataBuffer(i, j);
+    return rc;
+}
+
+
+int aqzDecompress(AQzSession_T *sess, const unsigned char *src,
+                  unsigned int src_len, unsigned char *dest,
+                  unsigned int dest_len, void *user_info,
+                  int inst, AQzFunc_t callbackFn)
+{
+    int rc = QZ_OK;
+    int i = -1, j = -1;
+    QzSess_T *qz_sess;
+    AQzQueue_T *queue;
+    unsigned char *src_ptr;
+    QzGzH_T hdr = {{0}, 0};
+    unsigned int max_dest_sz = 0;
+
+    if (unlikely(NULL == sess                 || \
+                 NULL == src                  || \
+                 0 >= src_len                 || \
+                 NULL == dest                 || \
+                 0 >= dest_len)) {
+        QZ_ERROR("Invalid params\n");
+        rc = QZ_PARAMS;
+        return rc;
+    }
+    grabProcessId();
+
+    if (unlikely(g_process.qz_init_status != QZ_OK)) {
+        QZ_ERROR("Unknown instance status: %d\n", g_process.qz_init_status);
+        return g_process.qz_init_status;
+    }
+
+    if (unlikely(sess->hw_session_stat != QZ_OK &&
+        sess->hw_session_stat != QZ_NO_INST_ATTACH)) {
+        QZ_ERROR("Unknown session status: %d\n", sess->hw_session_stat); 
+        return sess->hw_session_stat;
+    }
+
+    if (unlikely(NULL == sess->internal ||
+        NULL == sess->aqz_sess_params)) {
+        QZ_ERROR("Unknown session data\n"); 
+        rc = QZ_FAIL;
+        return rc;
+    }
+
+    qz_sess = (QzSess_T *)(sess->internal);
+
+    QzDataFormat_T data_fmt = qz_sess->sess_params.data_fmt;
+    if (unlikely(data_fmt != QZ_DEFLATE_RAW &&
+                 data_fmt != QZ_DEFLATE_GZIP &&
+                 data_fmt != QZ_DEFLATE_GZIP_EXT)) {
+        QZ_ERROR("Unknown data formt: %d\n", data_fmt);
+        rc = QZ_PARAMS;
+        return rc;
+    }
+
+    src_ptr = (unsigned char *)src;
+    rc = checkHeader(qz_sess, src_ptr, src_len, dest_len, &hdr);
+    if (QZ_OK != rc) {
+        QZ_ERROR("Invalid decompress data\n"); 
+        return rc;
+    }
+    max_dest_sz = qzMaxCompressedLength(qz_sess->sess_params.hw_buff_sz, (QzSession_T *)sess);
+    if (max_dest_sz < hdr.extra.qz_e.dest_sz) {
+        QZ_ERROR("aqzDecompress Input data size %ld exceeds threshold %ld\n", hdr.extra.qz_e.dest_sz, max_dest_sz);
+        rc = QZ_PARAMS;
+        return rc;
+    }
+
+    if (inst >= 0) {
+        i = aqzGetInstance(inst);
+    } else {
+        i = aqzGetInstance(g_instance_index.index);
+    }
+    if (unlikely(i == -1)) {
+        rc = QZ_NO_INST_ATTACH;
+        return rc;
+    }
+
+    g_aqzprocess.aqz_thread_activity = CPA_TRUE;
+
+    if (likely(0 == g_aqzprocess.aqz_inst[i].mem_setup     ||
+               0 == g_aqzprocess.aqz_inst[i].cpa_sess_setup)) {
+        rc = QZ_FAIL;
+        goto done;
+    }
+
+
+    queue = &g_aqzprocess.aqz_queue[i].queue_i;
+
+    do {
+        j = aqz_getQUnusedBuffer(i, j);
+        if (-1 == j) {
+          usleep(0);
+        //   sched_yield();
+        }
+    } while (-1 == j);
+    // if (unlikely(-1 == j)) {
+    //     QZ_DEBUG("aqzDecompress instance %ld Queue remaining space is insufficient\n", i);
+    //     rc = AQZ_NO_SPACE;
+    //     goto done;
+    // }
+    QZ_DEBUG("aqz_getQUnusedBuffer returned %d\n", j);
+
+    g_aqzprocess.aqz_inst[i].stream[j].src1++;
+    g_aqzprocess.aqz_inst[i].stream[j].src2++;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.func_mode = QZ_FUNC_BASIC;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.qz_in_len = 0;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.qz_out_len = 0;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.data_fmt = data_fmt;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.dir = QZ_DIR_DECOMPRESS;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.src = (unsigned char *)src;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.src_sz = src_len;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.next_dest = (unsigned char *)dest;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.dest_sz = dest_len;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.mem_hint = j;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.inst_hint = i;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.user_info = user_info;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.callbackFn = callbackFn;
+    g_aqzprocess.aqz_inst[i].queue_buffers[j]->header.sw_mode = g_aqzprocess.sw_mode;
+
+    rc = aqz_queuePush(queue, g_aqzprocess.aqz_inst[i].queue_buffers[j]);
+    if (QZ_OK != rc) {
+        g_aqzprocess.aqz_inst[i].stream[j].src1--;
+        g_aqzprocess.aqz_inst[i].stream[j].src2--;
+    }
+done:
+    qzReleaseInstance(i);
+    return rc;
+}
+
+int aqz_doDecompressIn(AQzQueue_T *queue)
+{
+    int i, j, rc;
+    unsigned int src_send_sz;
+    unsigned int dest_receive_sz;
+    unsigned char *src_ptr;
+    unsigned char *dest_ptr;
+    int src_pinned = 0;
+    int dest_pinned = 0;
+    AQzQueueHeader_T *aqz_header;
+
+    aqz_header = &queue->queue_buffers[queue->tail]->header;
+
+    StdGzF_T *qzFooter = NULL;
+    QzDataFormat_T data_fmt = aqz_header->data_fmt;
+
+    i = aqz_header->inst_hint;
+    if (unlikely(i == -1)) {
+        return QZ_FAIL;
+    }
+
+    if (CPA_TRUE == aqz_header->sw_mode) {
+        goto err_exit;
+    }
+
+    j = aqz_header->mem_hint;
+    src_ptr = aqz_header->src;
+    dest_ptr = aqz_header->next_dest;
+    src_pinned = qzMemFindAddr(src_ptr);
+    dest_pinned = qzMemFindAddr(dest_ptr);
+    src_send_sz = aqz_header->src_sz - outputHeaderSz(data_fmt) - stdGzipFooterSz();
+    dest_receive_sz = (long)aqz_header->dest_sz;
+
+    QZ_DEBUG("src_send_sz is %d, dest_receive_sz is %d\n",
+                src_send_sz, dest_receive_sz);
+
+    aqz_swapDataBuffer(i, j);
+    src_ptr += outputHeaderSz(data_fmt);
+
+    g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->dataLenInBytes = src_send_sz;
+    g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->dataLenInBytes =
+        dest_receive_sz;
+    QZ_DEBUG("aqz_doDecompressIn: Sending %ld bytes starting at 0x%lx\n",
+                src_send_sz, (unsigned long)src_ptr);
+
+    qzFooter = (StdGzF_T *)(src_ptr + src_send_sz);
+    g_aqzprocess.aqz_inst[i].stream[j].gzip_footer_checksum = qzFooter->crc32;
+    g_aqzprocess.aqz_inst[i].stream[j].gzip_footer_orgdatalen = qzFooter->i_size;
+
+    /*set up src dest buffers*/
+    if (unlikely(0 == src_pinned)) {
+        QZ_DEBUG("memory copy in aqz_doDecompressIn\n");
+        QZ_MEMCPY(g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->pData,
+                  src_ptr,
+                  src_send_sz,
+                  src_send_sz);
+        g_aqzprocess.aqz_inst[i].stream[j].src_pinned = 0;
+    } else {
+        g_aqzprocess.aqz_inst[i].stream[j].src_pinned = 1;
+        g_aqzprocess.aqz_inst[i].stream[j].orig_src =
+            g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->pData;
+        g_aqzprocess.aqz_inst[i].src_buffers[j]->pBuffers->pData = src_ptr;
+    }
+
+    if (unlikely(0 == dest_pinned)) {
+        g_aqzprocess.aqz_inst[i].stream[j].dest_pinned = 0;
+    } else {
+        g_aqzprocess.aqz_inst[i].stream[j].orig_dest =
+            g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->pData;
+        g_aqzprocess.aqz_inst[i].dest_buffers[j]->pBuffers->pData = dest_ptr;
+        g_aqzprocess.aqz_inst[i].stream[j].dest_pinned = 1;
+    }
+
+    g_aqzprocess.aqz_inst[i].stream[j].res.checksum = 0;
+
+    do {
+        QZ_DEBUG("Decomp Sending i = %ld j = %d\n", i, j);
+
+        rc = cpaDcDecompressData(g_process.dc_inst_handle[i],
+                                 g_process.qz_inst[i].cpaSess,
+                                 g_aqzprocess.aqz_inst[i].src_buffers[j],
+                                 g_aqzprocess.aqz_inst[i].dest_buffers[j],
+                                 &g_aqzprocess.aqz_inst[i].stream[j].res,
+                                 CPA_DC_FLUSH_FINAL,
+                                 (void *)(aqz_header));
+
+        if (unlikely(CPA_STATUS_RETRY == rc || CPA_STATUS_RESTARTING == rc)) {
+        //    usleep(g_polling_interval[g_aqzprocess.aqz_inst[i].polling_idx]);
+            usleep(0);
+	//    sched_yield();
+	   g_process.qz_inst[i].num_retries++;
+        }
+
+        if (unlikely(g_process.qz_inst[i].num_retries > MAX_NUM_RETRY)) {
+            QZ_ERROR("instance %d retry count:%d exceed the max count: %d\n",
+                        i, g_process.qz_inst[i].num_retries, MAX_NUM_RETRY);
+            goto err_exit;
+        }
+    } while (rc == CPA_STATUS_RETRY || CPA_STATUS_RESTARTING == rc);
+
+    if (unlikely(CPA_STATUS_SUCCESS != rc)) {
+        QZ_ERROR("Error in cpaDcDpEnqueueOp: %d\n", rc);
+        goto err_exit;
+    }
+
+    g_process.qz_inst[i].num_retries = 0;
+    aqz_queuePop(queue);
+    rc = QZ_OK;
+    return rc;
+
+err_exit:
+    g_process.qz_inst[i].num_retries = 0;
+    doDcDpCallback((void *)aqz_header, CPA_STATUS_FAIL);
+    aqz_queuePop(queue);
+    rc = QZ_FAIL;
+    return rc;
+}
+
+int aqzGetInitDefaults(AQzInitParams_T *defaults)
+{
+    if (defaults == NULL) {
+        return QZ_PARAMS;
+    }
+
+    QZ_MEMCPY(defaults,
+              &g_aqzsess_init_params_default,
+              sizeof(AQzInitParams_T),
+              sizeof(AQzInitParams_T));
+    return QZ_OK;
 }

@@ -58,7 +58,7 @@
 
 static QzPageTable_T g_qz_page_table = {{{0}}};
 static pthread_mutex_t g_qz_table_lock = PTHREAD_MUTEX_INITIALIZER;
-static atomic_int g_table_init = 0;
+static int g_table_init = 0;
 static __thread unsigned char *g_a;
 extern processData_T g_process;
 
@@ -224,4 +224,50 @@ void qzFree(void *m)
     }
 
     m = NULL;
+}
+
+extern AProcessData_T g_aqzprocess;
+
+void *aqzMalloc(size_t sz, int numa, int pinned)
+{
+    //int status;
+    AQzSession_T temp_sess;
+    AQzInitParams_T temp_param;
+    qzMemSet(&temp_param, 0, sizeof(AQzInitParams_T));
+    qzMemSet(&temp_sess, 0, sizeof(AQzSession_T));
+
+    if (0 == g_table_init) {
+        if (0 != pthread_mutex_lock(&g_qz_table_lock)) {
+            return NULL;
+        }
+
+        qzMemSet(&g_qz_page_table, 0, sizeof(QzPageTable_T));
+        g_table_init = 1;
+        atexit(qzMemDestory);
+
+        if (0 != pthread_mutex_unlock(&g_qz_table_lock)) {
+            return NULL;
+        }
+    }
+    /*
+    if (1 == pinned && QZ_NONE == g_aqzprocess.qz_sy_init_status) {
+        status = aqzSyInit(&temp_sess,&temp_param, 1);
+        if (QZ_OK != status && QZ_DUPLICATE != status && QZ_NO_HW != status &&
+            QZ_NOSW_NO_HW != status) {
+            QZ_ERROR("QAT init failed with error: %d\n", status);
+            return NULL;
+        }
+    }
+    */
+    g_a = qaeMemAllocNUMA(sz, numa, 64);
+    if (NULL == g_a) {
+        if (0 == pinned) {
+            QZ_DEBUG("regular malloc\n");
+            g_a = malloc(sz);
+        }
+    } else {
+        qzMemRegAddr(g_a, sz);
+    }
+
+    return g_a;
 }

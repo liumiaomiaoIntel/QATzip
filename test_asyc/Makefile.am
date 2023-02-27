@@ -32,74 +32,18 @@
 #
 ################################################################
 
-bin_PROGRAMS = qzip aqzip
-qzip_SOURCES = \
-               qzip_7z.c \
-               qzip_main.c \
-               qzip.c
-qzip_CFLAGS = \
+noinst_PROGRAMS = atest
+atest_SOURCES = amain.c
+atest_CXXFLAGS = \
               -I$(abs_top_srcdir)/include/ \
               -I$(abs_top_srcdir)/src/    \
               -I$(abs_top_srcdir)/utils/  \
-              $(COMMON_CFLAGS) \
+              $(COMMON_CXXFLAGS) \
               $(ICP_INCLUDE_CFLAGS)
-qzip_LDADD = \
+atest_LDADD = \
              $(abs_top_srcdir)/src/.libs/libqatzip.a \
              $(QATLIB_FLAGS) \
              $(USDMLIB_FLAGS)
-qzip_LDFLAGS = \
+atest_LDFLAGS = \
                $(ICP_LDFLAGS)
 
-qzip_obj_CFLAGS = \
-                  -I$(abs_top_srcdir)/include/ \
-                  -I$(abs_top_srcdir)/src/    \
-                  -I$(abs_top_srcdir)/utils/  \
-                  $(COMMON_CFLAGS) \
-                  $(ICP_INCLUDE_CFLAGS)
-
- 
-aqzip_SOURCES = \
-                aqzip_main.c \
-                aqzip.c
-aqzip_CFLAGS = \
-              -I$(abs_top_srcdir)/include/ \
-              -I$(abs_top_srcdir)/src/    \
-              -I$(abs_top_srcdir)/utils/  \
-              $(COMMON_CFLAGS) \
-              $(ICP_INCLUDE_CFLAGS)
-aqzip_LDADD = \
-             $(abs_top_srcdir)/src/.libs/libqatzip.a \
-             $(QATLIB_FLAGS) \
-             $(USDMLIB_FLAGS)
-aqzip_LDFLAGS = \
-               $(ICP_LDFLAGS)
-
-aqzip_obj_CFLAGS = \
-                  -I$(abs_top_srcdir)/include/ \
-                  -I$(abs_top_srcdir)/src/    \
-                  -I$(abs_top_srcdir)/utils/  \
-                  $(COMMON_CFLAGS) \
-                  $(ICP_INCLUDE_CFLAGS)
-
-if QATZIP_LZ4S_POSTPROCESS_AC
-noinst_PROGRAMS = qzstd
-qzstd_SOURCES = \
-                qzstd.c \
-                qzstd_main.c
-qzstd_CFLAGS = \
-               -I$(abs_top_srcdir)/include/ \
-               -I$(abs_top_srcdir)/src/    \
-               -I$(abs_top_srcdir)/utils/  \
-               $(COMMON_CFLAGS) \
-               $(ICP_INCLUDE_CFLAGS)
-qzstd_LDADD = \
-              $(abs_top_srcdir)/src/.libs/libqatzip.a \
-              $(QATLIB_FLAGS) \
-              $(USDMLIB_FLAGS) \
-              $(ZSTD_LIBADD)
-qzstd_LDFLAGS = \
-                $(ICP_LDFLAGS)
-endif
-
-qzip_obj_without_main: qzip.c qzip_7z.c
-	$(CC) $^ -c $(qzip_obj_CFLAGS)

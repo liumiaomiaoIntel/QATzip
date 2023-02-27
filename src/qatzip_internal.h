@@ -41,11 +41,13 @@ extern"C" {
 #endif
 #ifdef HAVE_QAT_HEADERS
 #include <qat/cpa_dev.h>
+#include <qat/cpa_dc_dp.h>
 #else
 #include <cpa_dev.h>
+#include <cpa_dc_dp.h>
 #endif
 #include <stdbool.h>
-#include <stdatomic.h>
+//#include <stdatomic.h>
 #include <zlib.h>
 #include <lz4frame.h>
 
@@ -216,7 +218,7 @@ typedef struct ProccesData_S {
     CpaInstanceHandle *dc_inst_handle;
     QzInstance_T *qz_inst;
     Cpa16U num_instances;
-    atomic_char qat_available;
+    char qat_available;
     CpaDeviceInfo device_info;
 } processData_T;
 
@@ -514,4 +516,238 @@ void qzSetParamsDeflate(QzSessionParamsDeflate_T *params,
                         QzSessionParamsInternal_T *internal_params);
 void qzSetParams(QzSessionParams_T *params,
                  QzSessionParamsInternal_T *internal_params);
+
+////////////////AQATZIP
+#define AQZ_MAX_NUM_RETRY        ((int)5)
+#define AMAX_GRAB_RETRY          ((int)10)
+
+typedef void (*AQzThFunc_t)(void*);
+
+typedef struct AQzQStream_S {
+    signed long src1;
+    signed long src2;
+    signed long sink1;
+    signed long sink2;
+    CpaDcRqResults  res;
+    //CpaDcChainRqResults chainres;
+    CpaStatus job_status;
+    unsigned char *orig_src;
+    unsigned char *orig_dest;
+    int src_pinned;
+    int dest_pinned;
+    unsigned int gzip_footer_checksum;
+    unsigned int gzip_footer_orgdatalen;
+} AQzQStream_T;
+
+typedef enum AQzQueueMode_E {
+    AQZ_QUEUE_IN = 0,
+    AQZ_QUEUE_OUT
+} AQzQueueMode_T;
+/*
+typedef struct AQzQueueHeader_S {
+    int inst_hint;
+    int mem_hint;
+    QzDataFormat_T data_fmt;
+    QzDirection_T dir;
+    unsigned char *src;
+    unsigned int src_sz;
+    unsigned char *next_dest;
+    unsigned char *next_digest;
+    unsigned int dest_sz;
+    unsigned long *crc32;
+    unsigned long qz_in_len;
+    unsigned long qz_out_len;
+    unsigned long digest_len;
+    unsigned char sw_backup;
+    void *user_info;
+    AQzFunc_t callbackFn;
+	QzFuncMode_T func_mode;
+    unsigned int hashAlg;
+    unsigned int last;
+    char sw_mode;
+} AQzQueueHeader_T;
+*/
+typedef struct AQzQueuePayload_S {
+    CpaDcDpOpData *op_data;
+    //CpaCySymOpData *op_cydata;
+} AQzQueuePayload_T;
+
+typedef struct AQzQueueBufferList_S {
+    AQzQueueHeader_T header;
+    AQzQueuePayload_T payload;
+} AQzQueueBufferList_T;
+
+typedef struct AQzQueue_S
+{
+    unsigned int req;
+    unsigned int submit;
+    int head;
+    int tail;
+    int count;
+    int size;
+    AQzQueueBufferList_T **queue_buffers;
+} AQzQueue_T;
+
+typedef struct AQzQueueInstance_S
+{
+    unsigned char queue_th_setup;
+    AQzQueue_T queue_i;
+    AQzQueue_T queue_o;
+    int stop_th;
+    int inst;
+    pthread_t *c_th_i;
+    pthread_t *c_th_o;
+    AQzThFunc_t *th_func;
+    int queue_idx;
+    int submitrq_count;
+    char aqz_thread_activity;
+} AQzQueueInstance_T;
+
+typedef struct AQzInstance_S {
+    Cpa32U src_count;
+    Cpa32U dest_count;
+    Cpa8U **digest_buffers;
+    Cpa32U buff_meta_size;
+    CpaBufferList **src_buffers;
+    CpaBufferList **dest_buffers;
+    AQzQStream_T *stream;
+    AQzQueueBufferList_T **queue_buffers;
+    unsigned char mem_setup;
+    unsigned char chain_mem_setup;
+    unsigned char cpa_sess_setup;
+    //CpaDcChainOpData chainOpData[CHAIN_MAX_SESSION];
+    //CpaCySymOpData cyOpData;
+    CpaDcOpData dcOpData;
+    unsigned int polling_idx;
+} AQzInstance_T;
+
+typedef struct AQzSyInstance_S {
+    Cpa8U **digest_buffers;
+    CpaInstanceInfo2 instance_info;
+    //CpaCyCapabilitiesInfo sy_instance_cap;
+	AQzQStream_T *stream;
+	AQzQueueBufferList_T **queue_buffers;
+    unsigned int lock;
+    time_t heartbeat;
+    unsigned char mem_setup;
+    unsigned char cpa_sess_setup;
+    CpaStatus inst_start_status;
+    unsigned int num_retries;
+    // CpaSymSessionHandle cpaSess;
+    CpaBufferList** src_buffers;
+    Cpa16U src_count;
+    Cpa32U buff_meta_size;
+    //CpaCySymSessionCtx sessionCtx;
+    unsigned int polling_idx;
+} AQzSyInstance_T;
+
+typedef struct AQzSyInstanceList_S {
+    AQzSyInstance_T instance;
+    CpaInstanceHandle sy_inst_handle;
+    struct AQzSyInstanceList_S *next;
+} AQzSyInstanceList_T;
+
+typedef struct AQzHardware_S {
+    AQzSyInstanceList_T devices[QAT_MAX_DEVICES];
+    unsigned int dev_num;
+    unsigned int max_dev_id;
+} AQzHardware_T;
+
+typedef struct AProccesData_S {
+    unsigned char sw_backup;
+    char qz_init_status;
+    char qz_sy_init_status;
+    CpaInstanceHandle *sy_inst_handle;
+    Cpa16U num_sy_instances;
+    AQzInstance_T *aqz_inst;
+    AQzSyInstance_T *aqz_syinst;
+    char qat_available;
+    AQzQueueInstance_T *aqz_queue;
+    Cpa16U num_thread;
+    Cpa32U queue_sz;
+    char aqz_thread_status;
+    char aqz_thread_activity;
+    uint32_t digest_size;
+    unsigned int cy_hash_algorithm;
+    int submitrq_count;
+    int callback_count;
+    CpaBoolean sw_mode;
+} AProcessData_T;
+
+typedef struct AQzSess_S {
+    int inst_hint;
+    CpaStatus sess_status;
+    Cpa32U ctx_size;
+    AQzSessionParams_T sess_params;
+    //CpaCySymSessionCtx sessionCtx;
+    //CpaCySymSessionSetupData crypto_session_setup_data;
+    //CpaDcChainSessionSetupData chain_sess_data[CHAIN_MAX_SESSION];
+} AQzSess_T;
+
+typedef struct AQzIndex_S
+{
+    pid_t pid;
+    pid_t tid;
+    unsigned int index;
+} AQzIndex_T;
+
+
+void aqzOutputHeaderGen(unsigned char *ptr,
+                     void *res,
+                     QzDataFormat_T data_fmt,
+                     QzFuncMode_T func_mode);
+
+int aqz_setupHW(AQzSession_T *sess, int i);
+
+int aqz_doCompressIn(AQzQueue_T *queue);
+int aqz_doDecompressIn(AQzQueue_T *queue);
+//int aqz_doChainCompressIn(AQzQueue_T *queue);
+//int aqz_doChainDecompressIn(AQzQueue_T *queue);
+
+//int aqz_doHashIn(AQzQueue_T *queue);
+
+void aqz_cleanUpInitMem(int num, int sz);
+int aqzGetInstance(int hint);
+//int aqzGetSyInstance(int hint);
+void grabProcessId();
+int aqz_getQUnusedBuffer(unsigned long i, int j);
+//int aqz_getCyQUnusedBuffer(unsigned long i, int j);
+
+int aqzISALCompress(AQzQueueBufferList_T *buffer_data, CpaDcRqResults *resl);
+
+int aqzISALDecompress(AQzQueueBufferList_T *buffer_data);
+
+//int aqzISALHash(AQzQueueBufferList_T *buffer_data);
+
+int aqz_sessParamsCheck(AQzSessionParams_T *params);
+
+int aqz_queueInit(AQzQueueInstance_T *queue_list, int size);
+int aqz_grabQueue(AQzQueueInstance_T *list, int num);
+int aqz_getInQueueMemory(AQzQueue_T *queue);
+int aqz_getOutQueueMemory(AQzQueue_T *queue);
+
+int aqz_queuePush(AQzQueue_T *queue, AQzQueueBufferList_T *data);
+
+void aqz_queuePop(AQzQueue_T *queue);
+
+int aqz_doCompressOut(AQzQueueBufferList_T *buffer_data);
+int aqz_doDecompressOut(AQzQueueBufferList_T *buffer_data);
+
+//int aqz_doChainCompressOut(AQzQueueBufferList_T *buffer_data);
+//int aqz_doChainDecompressOut(AQzQueueBufferList_T *buffer_data);
+
+//int aqz_doHashOut(AQzQueueBufferList_T *buffer_data);
+
+void aqzGzipFooterGen(unsigned char *ptr, void *res, QzFuncMode_T func_mode);
+
+void aqzOutputFooterGen(unsigned char *next_dest, void *res, QzDataFormat_T data_fmt, QzFuncMode_T func_mode);
+
+void aqz_initQueueData(AQzSession_T *sess, AQzQueue_T *q_in, unsigned int piece, AQzFunc_t callbackFn);
+int codeThreadBind(pthread_t *thread, int i, AQzSession_T *sess);
+int aqzCompressSw(AQzSession_T *sess, const unsigned char *src,
+                  unsigned int src_len, unsigned char *dest,
+                  unsigned int *dest_len);
+#ifdef __cplusplus
+}
+#endif
 #endif //_QATZIPP_H

@@ -48,6 +48,7 @@ AC_SUBST([LIBQATZIP_VERSION], [3:1:0])
 # Checks for programs.
 AC_PROG_AWK
 AC_PROG_CC
+AC_PROG_CXX
 AC_PROG_LN_S
 AC_PROG_MAKE_SET
 AM_PROG_AR
@@ -106,6 +107,10 @@ AC_CHECK_LIB([z], [deflate], , AC_MSG_ERROR([deflate not found]))
 AC_CHECK_HEADER([lz4.h], , [AC_MSG_ERROR([lz4.h not found])])
 AC_CHECK_HEADER([lz4frame.h], , [AC_MSG_ERROR([lz4frame.h not found])])
 AC_CHECK_LIB([lz4], [LZ4F_compressBegin], , AC_MSG_ERROR([LZ4F_compressBegin not found]))
+
+#check for isal lib
+AC_CHECK_HEADER([isa-l.h], , [AC_MSG_ERROR([isa-l.h not found])])
+AC_CHECK_LIB([isal], [isal_deflate_init], , AC_MSG_ERROR([isal_deflate_init not found]))
 
 ##check for xxhash lib
 #AC_CHECK_HEADER([xxhash.h],,[AC_MSG_ERROR([not found xxhash.h])])
@@ -237,6 +242,13 @@ AC_ARG_ENABLE(debug,
 )
 AM_CONDITIONAL([QATZIP_DEBUG_AC], [test x$debug = xtrue])
 
+#check for compile flags
+AC_MSG_CHECKING([cxxflags])
+CXXFLAGS+=' -Wall -Werror -std=c++20 -fcoroutines -pthread \
+            -fstack-protector \
+            -fno-delete-null-pointer-checks -fwrapv '
+AC_MSG_RESULT([yes])
+
 #Enable qatzip symbol
 AC_ARG_ENABLE(symbol,
     AS_HELP_STRING([--enable-symbol], [Enable qatzip symbol]),
@@ -288,6 +300,7 @@ AC_CONFIG_FILES([Makefile
                  qatzip.spec
                  src/Makefile
                  test/Makefile
+                 test_asyc/Makefile
                  utils/Makefile]
                  qatzip.pc)
 AC_OUTPUT

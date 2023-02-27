@@ -34,12 +34,13 @@
 
 QZIP_DIR = $(top_builddir)/utils
 TEST_DIR = $(top_builddir)/test
+FUNCTEST_SRC_DIR = $(top_builddir)/test_asyc
 QATZIP_LIB_DIR = $(top_builddir)/src
 QATZIP_LIB = libqatzip.la
 CODE_FORMATTING_BIN = $(top_builddir)/test/code_format_tests/format.sh
 
-DIST_SUBDIRS = src utils test
-SUBDIRS = src utils test
+DIST_SUBDIRS = src utils test test_asyc
+SUBDIRS = src utils test test_asyc
 
 pkgincludedir = $(includedir)
 pkginclude_HEADERS = include/qatzip.h
@@ -56,7 +57,10 @@ EXTRA_DIST = \
              src/qatzip_internal.h \
              src/qatzip_page_table.h \
              utils/qzip.h \
+			 utils/aqzip.h \
              utils/qzstd.h \
+			 test_asyc/code_format_tests \
+             test_asyc/performance_tests \
              test/code_format_tests \
              test/performance_tests \
              docs/QATzip-man.pdf \
@@ -72,8 +76,14 @@ qzip: $(QATZIP_LIB)
 qzip_obj_without_main:
 	@make -C $(QZIP_DIR) qzip_obj_without_main
 
+aqzip: $(QATZIP_LIB)
+	@make -C $(QZIP_DIR) aqzip
+
 test:$(QATZIP_LIB)
 	@make -C $(TEST_DIR) test
+
+atest: $(QATZIP_LIB)
+	@make -C $(FUNCTEST_SRC_DIR) atest
 
 bt:$(QATZIP_LIB)
 	@make -C $(TEST_DIR) bt
@@ -106,6 +116,6 @@ rpm: clean dist qatzip.spec
 rpmclean:
 	@rm -fr rpmbuild
 
-.PHONY: rpm rpmclean libqatzip qzip test check_code \
+.PHONY: rpm rpmclean libqatzip qzip test atest aqzip check_code \
 	qzip_obj_without_main bt $(QATZIP_LIB) clean-local \
 	qzstd
