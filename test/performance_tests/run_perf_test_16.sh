@@ -145,8 +145,8 @@ performance_test_with_calgary 100 0 1 4 decomp 1 /opt/compressdata/calgary 65536
 sleep 10
 
 Date=$(date "+%Y%m%d%H%M%S")
-echo "The test end at $Date, directory: $QZ_ROOT/test_result_2302/test"
-cp test_result $QZ_ROOT/test_result_2302/test/run_perf_test_result_$Date
+echo "The test end at $Date, directory: $QZ_ROOT/result_test_2023/test"
+cp test_result $QZ_ROOT/result_test_2023/test/run_perf_test_result_$Date
 
 if [ RC == 1 ];then
    echo "Performance test failed."

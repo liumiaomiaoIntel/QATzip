@@ -1,5 +1,5 @@
 #include <stdio.h>
-#define __USE_GNU 
+//#define __USE_GNU 
 #include <sched.h>
 #include <pthread.h>
 #include <sys/syscall.h>

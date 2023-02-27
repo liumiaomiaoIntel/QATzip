@@ -3856,8 +3856,8 @@ static int aqz_initQueue(AQzInitParams_T *params, AQzSession_T *sess)
         g_aqzprocess.aqz_queue[i].th_func = qzMalloc(2 * sizeof(AQzThFunc_t), numa_node, PINNED_MEM);
         AQZ_INIT_MEM_CHECK(g_aqzprocess.aqz_queue[i].th_func);
 
-        g_aqzprocess.aqz_queue[i].th_func[0] = aqz_submitRequestThread;
-        g_aqzprocess.aqz_queue[i].th_func[1] = aqz_pollingThread;
+        //g_aqzprocess.aqz_queue[i].th_func[0] = aqz_submitRequestThread;
+        //g_aqzprocess.aqz_queue[i].th_func[1] = aqz_pollingThread;
 
         aqz_queueInit(&g_aqzprocess.aqz_queue[i], queue_sz);
 
@@ -3871,15 +3871,15 @@ static int aqz_initQueue(AQzInitParams_T *params, AQzSession_T *sess)
         AQZ_CPU_CORE_BIND_CHECK(rc);*/
         
         if (i % params->submitrq_count == params->submitrq_count-1) {
-            pthread_create(g_aqzprocess.aqz_queue[i].c_th_i, NULL, g_aqzprocess.aqz_queue[i].th_func[0], (void *)&g_aqzprocess.aqz_queue[i]);
+            pthread_create(g_aqzprocess.aqz_queue[i].c_th_i, NULL, aqz_submitRequestThread, (void *)&g_aqzprocess.aqz_queue[i]);
         }
         if (g_aqzprocess.callback_count == g_process.num_instances) {
             if (i == 0) {
-                pthread_create(g_aqzprocess.aqz_queue[i].c_th_o, NULL, g_aqzprocess.aqz_queue[i].th_func[1], (void *)&g_aqzprocess.aqz_queue[i]);
+                pthread_create(g_aqzprocess.aqz_queue[i].c_th_o, NULL, aqz_pollingThread, (void *)&g_aqzprocess.aqz_queue[i]);
             }
         } else {
             if (i % params->callback_count == params->callback_count-1) {
-                pthread_create(g_aqzprocess.aqz_queue[i].c_th_o, NULL, g_aqzprocess.aqz_queue[i].th_func[1], (void *)&g_aqzprocess.aqz_queue[i]);
+                pthread_create(g_aqzprocess.aqz_queue[i].c_th_o, NULL, aqz_pollingThread, (void *)&g_aqzprocess.aqz_queue[i]);
             }
         }
         
@@ -5044,7 +5044,7 @@ done:
             g_aqzprocess.aqz_inst[i].stream[j].orig_dest;
         g_aqzprocess.aqz_inst[i].stream[j].dest_pinned = 0;
     }
-
+    return rc;
 err_check_footer:
     aqz_swapDataBuffer(i, j);
     return rc;

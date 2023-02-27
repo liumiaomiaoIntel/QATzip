@@ -113,6 +113,7 @@ function performance_test_with_calgary
 }
 
 #Parameter: NumProcess NumDcInstance Numprocess Thread Service Level Testfile Huffman Buffersz
+
 ./server_cpu_usage.pl 7 NGINX
 ./memory_monitor.pl
 performance_test_with_calgary 100 0 1 4 comp 1 /opt/compressdata/calgary 4096
@@ -150,10 +151,9 @@ performance_test_with_calgary 100 0 1 4 decomp 1 /opt/compressdata/calgary 65536
 ./read_memory.sh
 sleep 10
 
-
 Date=$(date "+%Y%m%d%H%M%S")
-echo "The test end at $Date, directory: $QZ_ROOT/test_result_2302/atest"
-cp test_result $QZ_ROOT/test_result_2302/atest/run_perf_test_result_$Date
+echo "The test end at $Date, directory: $QZ_ROOT/result_test_2023/atest"
+cp test_result $QZ_ROOT/result_test_2023/atest/run_perf_test_result_$Date
 
 if [ RC == 1 ];then
    echo "Performance test failed."
@@ -163,6 +163,32 @@ else
 fi
 echo "***QZ_TOOL run_perf_atest.sh end"
 exit 0
+
+./server_cpu_usage.pl 7 NGINX
+./memory_monitor.pl
+performance_test_with_calgary 100 0 1 4 comp 1 /opt/compressdata/calgary 4096
+./read_server_cpu_usage_nginx.pl 7
+./read_memory.sh
+sleep 10
+./server_cpu_usage.pl 7 NGINX
+./memory_monitor.pl
+performance_test_with_calgary 100 0 1 4 decomp 1 /opt/compressdata/calgary 4096
+./read_server_cpu_usage_nginx.pl 7
+./read_memory.sh
+sleep 10
+./server_cpu_usage.pl 7 NGINX
+./memory_monitor.pl
+performance_test_with_calgary 100 0 1 4 comp 1 /opt/compressdata/calgary 16384
+./read_server_cpu_usage_nginx.pl 7
+./read_memory.sh
+sleep 10
+./server_cpu_usage.pl 7 NGINX
+./memory_monitor.pl
+performance_test_with_calgary 100 0 1 4 decomp 1 /opt/compressdata/calgary 16384
+./read_server_cpu_usage_nginx.pl 7
+./read_memory.sh
+sleep 10
+
 
 ./server_cpu_usage.pl 7 NGINX
 ./memory_monitor.pl
